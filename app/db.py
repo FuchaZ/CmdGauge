@@ -33,17 +33,39 @@ _ALL_CONNS: list[sqlite3.Connection] = []
 _conn_lock = threading.Lock()  # 保护 _ALL_CONNS 与 schema 初始化
 _schema_ready = False
 _data_dir_override: Optional[str] = None
+_resolved_data_dir: Optional[str] = None  # data_dir 解析结果缓存 (进程内稳定)
 
 DB_FILENAME = "cmdgauge.db"
 ENV_DATA_DIR = "CMDGAUGE_DATA"
 
 
 def set_data_dir(path: str) -> None:
-    global _data_dir_override
+    global _data_dir_override, _resolved_data_dir
     _data_dir_override = path
+    _resolved_data_dir = None  # 覆盖后需重新解析
 
 
 def _default_data_dir() -> str:
+    """数据目录 (进程内只解析一次, 结果缓存).
+
+    必须缓存: 原实现每次调用都做一次「写探测」(创建/删除 .write-test), 而本函数
+    会被 HTTP 线程 / 同步线程 / 登录 watcher 线程**并发调用** —— 并发探测会互相
+    踩到同一个临时文件而间歇性失败, 于是回退到 ``%LOCALAPPDATA%``, 导致同一个
+    进程内出现**两个数据库** (登录写进 A、读取读 B), 表现为「登录后重启又要求登录」。
+    """
+    global _resolved_data_dir
+    if _resolved_data_dir:
+        return _resolved_data_dir
+    # 双检锁: 只让一个线程真正解析. 否则并发时多个线程会各自解析一次,
+    # 而写探测在并发下不稳定, 导致同进程内返回不同路径 (库分裂)。
+    with _conn_lock:
+        if _resolved_data_dir:
+            return _resolved_data_dir
+        _resolved_data_dir = _resolve_data_dir()
+        return _resolved_data_dir
+
+
+def _resolve_data_dir() -> str:
     if _data_dir_override:
         return os.path.abspath(_data_dir_override)
     if os.environ.get(ENV_DATA_DIR):
@@ -54,16 +76,32 @@ def _default_data_dir() -> str:
         candidate = os.path.join(exe_dir, "data")
         try:
             os.makedirs(candidate, exist_ok=True)
-            probe = os.path.join(candidate, ".write-test")
+            # 探测文件名带 pid+线程号: 并发调用时不会互相踩到同一个临时文件
+            # (原实现用固定名, 多线程同时创建/删除会大量失败并误判为不可写)
+            probe = os.path.join(
+                candidate, f".write-test-{os.getpid()}-{threading.get_ident()}"
+            )
             with open(probe, "w", encoding="utf-8") as fh:
                 fh.write("ok")
             os.remove(probe)
             return candidate
-        except OSError:
-            pass
+        except OSError as exc:
+            _log_dir_fallback(f"exe 同目录 {candidate} 不可写 ({exc})")
         local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
         return os.path.join(local, "CmdGauge", "data")
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+
+
+def _log_dir_fallback(reason: str) -> None:
+    """数据目录回退时落盘记录 (便于诊断「两个库」类问题)."""
+    try:
+        import tempfile
+
+        path = os.path.join(tempfile.gettempdir(), "cmdgauge_datadir.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now(timezone.utc).isoformat()} fallback to LOCALAPPDATA: {reason}\n")
+    except OSError:
+        pass
 
 
 def data_dir() -> str:
