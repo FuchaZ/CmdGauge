@@ -670,22 +670,7 @@ def fetch_models(cookie: str) -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-def fetch_profile(cookie: str, login: str) -> dict[str, Any]:
-    """拉取指定用户主页资料 (回填账号显示名/头像用).
-
-    站点没有"当前用户"端点 (``/internal/me`` 等均为 404), 只能按 login 查;
-    拿不到时返回 {} (不影响主流程).
-    """
-    login = (login or "").strip().strip("/")
-    if not login:
-        return {}
-    try:
-        data = _fetch(f"/internal/profile/{urllib.parse.quote(login)}", cookie)
-    except CmdAPIError:
-        return {}
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
-        return data["data"]
-    return {}
+# fetch_profile 统一使用文件末尾的实现 (此前此处有一份重复定义, 后者覆盖前者)
 
 
 def _ms_to_iso(ms: Any) -> tuple[str, int]:
@@ -754,8 +739,6 @@ def parse_quota(
 
     # 月度额度: 授予额度缺失时回退为"剩余 + 已用" (以周期内消费反推)
     period_end = str(subscription.get("currentPeriodEnd") or "")
-    # 月度额度: 授予额度缺失时回退为"剩余 + 已用" (以周期内消费反推)
-    period_end = str(subscription.get("currentPeriodEnd") or "")
     period_start = str(subscription.get("currentPeriodStart") or "")
     days_left: Optional[int] = None
     if period_end:
@@ -809,8 +792,6 @@ def parse_quota(
         )
 
     total_remaining = monthly_remaining + purchased + free
-    plan_id = str(subscription.get("planId") or "")
-    pinfo = plan_info(plan_id)
     return QuotaResult(
         name=name,
         org_id=org_id,

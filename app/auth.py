@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 
 import webview
 
+from . import db
+
 SITE_HOST = "commandcode.ai"
 SITE_BASE = "https://commandcode.ai"
 LOGIN_URL = "https://commandcode.ai/signin"
@@ -208,6 +210,13 @@ class LoginWatcher:
 
     def _run(self) -> None:
         _log("[login] watcher started")
+        try:
+            self._run_loop()
+        finally:
+            # on_success 回调在本线程内触库; 线程退出前回收其连接, 防泄漏
+            db.close_thread_conn()
+
+    def _run_loop(self) -> None:
         deadline = time.monotonic() + self.timeout_sec
         last_url = ""
         stuck_since = time.monotonic()

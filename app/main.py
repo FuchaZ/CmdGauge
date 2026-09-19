@@ -337,11 +337,12 @@ class WindowApi:
 
         自实现拖动替代 pywebview easy_drag: easy_drag 的 JS 用 clientX 记录起点、
         screenX 计算增量 (两坐标系在 DPI 缩放下不同源), 后端 move() 又把参数
-        乘一次 DPI 缩放, 高 DPI 屏幕上拖动会漂移抽动. 这里 JS 端 screenX 增量
-        已是物理像素, GetWindowRect/SetWindowPos 同为物理坐标, 全程 1:1 跟随.
+        乘一次 DPI 缩放, 高 DPI 屏幕上拖动会漂移抽动。前端已把 DIP 增量乘
+        devicePixelRatio 换算成物理像素 (含小数余量累积), 与 GetWindowRect/
+        SetWindowPos 的物理坐标系 1:1 对齐。
 
         加锁: js_api 高频触发时多个调用可能并发进入, 并发读-写会让多个线程
-        读到同一旧位置、各自 SetWindowPos, 增量被覆盖丢失.
+        读到同一旧位置、各自 SetWindowPos, 增量被覆盖丢失。
         """
         try:
             native = self._win.native

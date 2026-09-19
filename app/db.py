@@ -41,8 +41,11 @@ ENV_DATA_DIR = "CMDGAUGE_DATA"
 
 def set_data_dir(path: str) -> None:
     global _data_dir_override, _resolved_data_dir
-    _data_dir_override = path
-    _resolved_data_dir = None  # 覆盖后需重新解析
+    # 与 data_dir() 的双检锁共用: 否则并发解析期间覆盖 _resolved_data_dir
+    # 会重新制造「同进程两个库」
+    with _conn_lock:
+        _data_dir_override = path
+        _resolved_data_dir = None
 
 
 def _default_data_dir() -> str:
@@ -145,6 +148,27 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             return
         _init_schema(conn)
         _schema_ready = True
+
+
+def close_thread_conn() -> None:
+    """关闭并注销当前线程的连接.
+
+    临时线程 (HTTP 请求线程 / 同步 / 配额 worker) 结束前必须调用, 否则连接被
+    _ALL_CONNS 永久持有: 既不 close 也不移除, 长驻进程下按请求持续泄漏句柄。
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        return
+    _local.conn = None
+    with _conn_lock:
+        try:
+            _ALL_CONNS.remove(conn)
+        except ValueError:
+            pass
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def close_db() -> None:
@@ -311,6 +335,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 # settings payload 底层读写
 # ---------------------------------------------------------------------------
 
+# settings payload 是「整包 JSON 读-改-写」, 各线程用各自的连接并发进入时
+# 后写者会用旧快照覆盖前者 (丢 window_days/active_account_id 等), 必须串行化
+_settings_lock = threading.Lock()
+
 
 def _raw_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     row = conn.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
@@ -336,10 +364,17 @@ def _write_payload(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
 
 
 def _persist_active(conn: sqlite3.Connection, account_id: int) -> None:
-    data = _raw_payload(conn)
-    data["active_account_id"] = int(account_id)
-    _write_payload(conn, data)
-    conn.commit()
+    with _settings_lock:
+        data = _raw_payload(conn)
+        data["active_account_id"] = int(account_id)
+        _write_payload(conn, data)
+        conn.commit()
+
+
+def _persist_active_if_changed(conn: sqlite3.Connection, account_id: int) -> None:
+    """仅在值变化时写入 (get_active_account_id 的自动回落路径调用频繁, 避免写放大)."""
+    if _raw_payload(conn).get("active_account_id") != int(account_id):
+        _persist_active(conn, account_id)
 
 
 def get_active_account_id() -> int:
@@ -359,16 +394,16 @@ def get_active_account_id() -> int:
             if row["token"].strip():
                 return aid
             if logged_min:
-                _persist_active(conn, logged_min)
+                _persist_active_if_changed(conn, logged_min)
                 return logged_min
             return aid
     if logged_min:
-        _persist_active(conn, logged_min)
+        _persist_active_if_changed(conn, logged_min)
         return logged_min
     row = conn.execute("SELECT MIN(id) AS i FROM accounts").fetchone()
     fallback = int(row["i"]) if row and row["i"] is not None else 0
     if fallback:
-        _persist_active(conn, fallback)
+        _persist_active_if_changed(conn, fallback)
     return fallback
 
 
@@ -553,10 +588,16 @@ def rename_account(account_id: int, name: str) -> bool:
 
 
 def delete_account(account_id: int) -> int:
-    """删除账号及其本地全部数据 (级联), 返回剩余账号数."""
+    """删除账号及其本地全部数据 (级联), 返回剩余账号数.
+
+    usage_buckets / account_summaries 没有外键约束 (PRAGMA foreign_keys 管不到),
+    必须在这里显式删除, 否则磁盘上永久累积孤儿行。
+    """
     conn = get_db()
     aid = int(account_id)
     conn.execute("DELETE FROM usage_records WHERE account_id = ?", (aid,))
+    conn.execute("DELETE FROM usage_buckets WHERE account_id = ?", (aid,))
+    conn.execute("DELETE FROM account_summaries WHERE account_id = ?", (aid,))
     conn.execute("DELETE FROM usage_sync_state WHERE account_id = ?", (aid,))
     conn.execute("DELETE FROM accounts WHERE id = ?", (aid,))
     remaining = int(conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"])
@@ -575,12 +616,18 @@ def delete_account(account_id: int) -> int:
 
 
 def clear_account() -> None:
-    """退出登录当前活跃账号: 清除凭证与本地缓存数据 (保留账号行)."""
+    """退出登录当前活跃账号: 清除凭证与本地缓存数据 (保留账号行).
+
+    usage_buckets / account_summaries 一并清除: 否则重登后缓存命中率与
+    API Key 模式概览会显示登出前的旧数据。
+    """
     conn = get_db()
     aid = get_active_account_id()
     if not aid:
         return
     conn.execute("DELETE FROM usage_records WHERE account_id = ?", (aid,))
+    conn.execute("DELETE FROM usage_buckets WHERE account_id = ?", (aid,))
+    conn.execute("DELETE FROM account_summaries WHERE account_id = ?", (aid,))
     conn.execute(
         "UPDATE accounts SET token = '', updated_at = ? WHERE id = ?",
         (_now_iso(), aid),
@@ -769,40 +816,45 @@ def get_settings() -> dict[str, Any]:
 
 def save_settings(payload: dict[str, Any]) -> dict[str, Any]:
     conn = get_db()
-    raw = _raw_payload(conn)
-    current = dict(_DEFAULT_SETTINGS)
-    current.update({k: v for k, v in raw.items() if k in _DEFAULT_SETTINGS})
-    for key in _DEFAULT_SETTINGS:
-        if key not in payload:
-            continue
-        value = payload[key]
-        if key == "sync_interval_sec":
-            if value is None:
+    with _settings_lock:  # 整包读-改-写, 与 _persist_active 串行化
+        raw = _raw_payload(conn)
+        current = dict(_DEFAULT_SETTINGS)
+        current.update({k: v for k, v in raw.items() if k in _DEFAULT_SETTINGS})
+        for key in _DEFAULT_SETTINGS:
+            if key not in payload:
                 continue
-            try:
-                current[key] = max(30, min(int(value), 3600))
-            except (TypeError, ValueError):
-                pass
-        elif key == "window_days":
-            # None / 空串 / "all" 均表示不裁剪 (原实现被外层 is not None 挡掉, 导致
-            # 前端选「所有」不生效, 这里显式支持)
-            if value is None or value == "" or str(value).lower() in ("all", "所有"):
-                current[key] = None
-            else:
+            value = payload[key]
+            if key == "sync_interval_sec":
+                if value is None:
+                    continue
                 try:
-                    current[key] = max(1, min(int(value), 3650))
+                    current[key] = max(30, min(int(value), 3600))
                 except (TypeError, ValueError):
                     pass
-        elif key in ("auto_sync", "show_accounts_panel"):
-            if value is None:
-                continue
-            current[key] = bool(value)
-        else:
-            current[key] = value
-    out = dict(raw)
-    out.update(current)
-    _write_payload(conn, out)
-    conn.commit()
+            elif key == "window_days":
+                # None / 空串 / "all" 均表示不裁剪 (原实现被外层 is not None 挡掉, 导致
+                # 前端选「所有」不生效, 这里显式支持)
+                if value is None or value == "" or str(value).lower() in ("all", "所有"):
+                    current[key] = None
+                else:
+                    try:
+                        current[key] = max(1, min(int(value), 3650))
+                    except (TypeError, ValueError):
+                        pass
+            elif key in ("auto_sync", "show_accounts_panel"):
+                if value is None:
+                    continue
+                # 严格布尔转换: bool("false") 是 True, 字符串会被静默当成开关打开
+                if isinstance(value, bool):
+                    current[key] = value
+                else:
+                    current[key] = str(value).strip().lower() in ("1", "true", "yes", "on", "是")
+            else:
+                current[key] = value
+        out = dict(raw)
+        out.update(current)
+        _write_payload(conn, out)
+        conn.commit()
     return current
 
 

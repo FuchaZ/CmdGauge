@@ -146,3 +146,16 @@ UI 对月度卡标注「额度按套餐估算」）；两模式的 5h/weekly/mon
 | 浏览器登录卡在「正在重定向到已授权应用」页 | OAuth 的 `redirect_uri` 落在 **`api.commandcode.ai/auth/callback`**，而 watcher 用 `SITE_HOST in url` 判断，把 api 子域误认为「已回到站点」，于是只反复查 cookie、**永远不进兜底分支** | 新增 `host_of` / `needs_nudge`：api 子域一律视为自动流程页；GitHub 仅在「重定向回应用」页干预；卡住超时后先点击页面上的 setup/continue 链接，无效则导航回站点。日志改为记录**所有** URL 变化与 cookie 名单，便于定位 |
 | API Key 登录后「用量概览」全是 0（但月度额度有值） | `/alpha/usage/summary` 本来有数据却从未被使用；且 `/alpha/billing/credits` **不返回** `monthlyCreditsGranted`（只有 `/internal` 版本才有），导致月度卡片 `used = granted(0) − 剩余` 被夹成 0 | 新增 `account_summaries` 表与 `summary_as_totals`：apikey 同步时保存账单汇总，dashboard 据此兜底并返回 `totals_source`；额度缺失时回落套餐映射并标记 `monthly_granted_from_plan`，UI 标注「额度按套餐估算」 |
 | 程序窗口无法调整大小 | `frameless=True` → WinForms `FormBorderStyle.None`，系统不再提供边框拖拽 | 前端 6px 边缘热区捕获拖拽（捕获阶段先于标题栏拖动逻辑）+ 后端 `resize_by` → `SetWindowPos`；几何计算抽成纯函数 `_compute_resized_rect` 并夹紧 `WINDOW_MIN_SIZE` |
+
+## 7. 修复记录（v1.0.2）
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| **高 DPI/缩放屏拖窗口不跟手**（窗口只以鼠标 1/scale 速度移动，实测 1.375 屏上 300px 拖动只走 218px） | Chromium/WebView2 的 `MouseEvent.screenX/screenY` 是 **DIP(逻辑像素)**，而 `move_by`/`resize_by` 按 `GetWindowRect` 的**物理像素**直接累加；v1.0.1 注释「screenX 已是物理像素」的假设错误（实测本机 system DPI=1.25 而显示器有效缩放=1.375，两者还不同） | 前端增量统一 **× `devicePixelRatio`** 换算为物理像素，浮点累积 + 发整数 + 小数余量留到下帧（无取整漂移）；`app.js` bindTitlebar/bindWindowResize。SendInput 实测修复后 300px 拖动窗口走 300px（±取整 ≤3px） |
+| mouseup 丢失后「幽灵拖动」/拖动与缩放同时残留 | mousemove 不校验 `e.buttons`，无 blur 兜底；`#user-menu` 内的 div 菜单项还会误触发窗口拖动 | mousemove 检测 `!(e.buttons & 1)` 即终止手势；补 `window.blur` 终止；mousedown 过滤选择器加 `#user-menu` |
+| **SQLite 连接按请求泄漏**（实测 50 请求泄 50 条，永不回收 → 长驻句柄耗尽） | `_Handler` 未设 `protocol_version`（HTTP/1.0 每请求一线程），线程内连接被 `_ALL_CONNS` 永久持有；同步/配额 worker 线程同理 | `_Handler` 改 `HTTP/1.1` keep-alive（线程与线程内连接复用）+ `finish()` 里 `db.close_thread_conn()`；sync/quota worker 与登录 watcher 线程退出时同样回收。实测 50 请求 → 0 常驻连接 |
+| 静态服务可读任意本机文件（`GET /C:/...`） | `os.path.join` 遇盘符绝对路径/UNC 整体重置，仅挡 `..` 无效；且无 Host 校验（DNS rebinding 面） | `_static_response` 解析后强制路径位于资源根内（realpath 前缀校验）；新增 `_host_allowed`（仅 127.0.0.1/localhost/::1）于所有入口校验 Host |
+| delete_account / 退出登录留孤儿数据 | `usage_buckets` / `account_summaries` 无外键，级联删除管不到 | 两处显式 `DELETE FROM usage_buckets / account_summaries` |
+| settings 并发读-改-写丢更新 | 整包 JSON 无锁并发覆盖 | 新增 `_settings_lock` 串行化 `_persist_active` 与 `save_settings`；`get_active_account_id` 自动回落路径改「值变化才写」防写放大 |
+| 一个账号 cookie 过期 → 多账号自动同步整个卡死 | incremental 循环遇错即 return，剩余账号不再同步 | 改为继续同步全部账号，结束时汇总：全部失败 `ok=False`（同时修掉 full 模式唯一目标失败仍 `ok=True` 的假成功），部分失败 `ok=True, partial=True, errors=[...]` |
+| 杂项 | —— | 未知 /api 路由返回 JSON 404；请求体 Content-Length 加固（非法/超大 400，上限 1MiB）；handler `timeout=120` 防永久阻塞；汇率拉取失败只短路 5 分钟（原失败被当新鲜缓存 6 小时）并加并发去重锁；`_ensure_quota_async` 防重入检查原子化；`bool("false")` 严格转换；logout/delete 与在飞同步互斥（409）；前端：更新弹窗 `latest/current` 转义、quota null 重试上限、轮询持续失败自恢复、`repeat` 负数保护、模型筛选失联回退、sparkline NaN、`fmtMoney` 负数、主题切换后总览图表与记录页图标刷新、`showModal` onOk 可保持弹窗（API Key 空输入不再丢）、启动失败自动重试、`commandcode_api.py` 重复 `fetch_profile` 去重 |

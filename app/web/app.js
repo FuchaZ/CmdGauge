@@ -255,16 +255,18 @@ function fmtInt(n) { return Number(n || 0).toLocaleString("en-US"); }
 /* Command Code 按美元计费且单次成本常小到 1e-5, 分档保留精度 */
 function fmtMoney(usd) {
   usd = Number(usd) || 0;
+  const sign = usd < 0 ? "-" : "";
+  const v = Math.abs(usd);
   if (state.currency === "CNY") {
-    const v = usd * state.exchangeRate;
-    if (v >= 1) return "¥" + v.toFixed(2);
-    if (v >= 0.01) return "¥" + v.toFixed(4);
-    if (v > 0) return "¥" + v.toFixed(6);
+    const c = v * state.exchangeRate;
+    if (c >= 1) return sign + "¥" + c.toFixed(2);
+    if (c >= 0.01) return sign + "¥" + c.toFixed(4);
+    if (c > 0) return sign + "¥" + c.toFixed(6);
     return "¥0";
   }
-  if (usd >= 1) return "$" + usd.toFixed(2);
-  if (usd >= 0.01) return "$" + usd.toFixed(4);
-  if (usd > 0) return "$" + usd.toFixed(6);
+  if (v >= 1) return sign + "$" + v.toFixed(2);
+  if (v >= 0.01) return sign + "$" + v.toFixed(4);
+  if (v > 0) return sign + "$" + v.toFixed(6);
   return "$0";
 }
 /* 毫秒耗时 (接口 durationTotal 单位 ms) */
@@ -369,7 +371,12 @@ function showModal({ title = t("confirm"), message = "", okText = t("ok"), cance
   icon.textContent = danger ? "⚠" : "?";
   overlay.hidden = false;
   const cleanup = () => { overlay.hidden = true; $("modal-ok").onclick = null; $("modal-cancel").onclick = null; };
-  $("modal-ok").onclick = () => { cleanup(); onOk && onOk(); };
+  // onOk 返回 false 表示校验未通过: 保持弹窗打开 (输入不丢)
+  $("modal-ok").onclick = async () => {
+    let keepOpen = false;
+    if (onOk) keepOpen = (await onOk()) === false;
+    if (!keepOpen) cleanup();
+  };
   $("modal-cancel").onclick = () => { cleanup(); };
 }
 function toast(msg, type = "ok") {
@@ -392,44 +399,52 @@ function bindTitlebar() {
   $("tb-theme").addEventListener("click", () => applyDarkMode(document.documentElement.dataset.theme !== "dark"));
 
   /* 标题栏拖动 (自实现, 替代 pywebview easy_drag):
-     增量取相邻两次 mousemove 的屏幕像素差, 用 rAF 合并后交给后端 move_by, 1:1 跟随 */
+     Chromium/WebView2 的 e.screenX/screenY 是 DIP(逻辑像素), 而后端 move_by 用
+     GetWindowRect/SetWindowPos 的物理像素坐标系 —— 增量必须乘 devicePixelRatio
+     换算, 否则高 DPI/缩放屏上窗口只以鼠标的 1/scale 速度移动 ("不跟手")。
+     物理像素以浮点累积、发整数、留小数余量到下一帧, 保证无取整漂移。 */
   let drag = null;
-  let pending = { x: 0, y: 0 };
+  let pending = { x: 0, y: 0 };  // 物理像素 (含小数余量)
   let rafId = null;
+  function cancelDrag() {
+    drag = null;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    flushDrag();
+  }
   function flushDrag() {
     rafId = null;
-    if (pending.x === 0 && pending.y === 0) return;
-    const dx = pending.x, dy = pending.y;
-    pending = { x: 0, y: 0 };
+    if (!pending.x && !pending.y) return;
+    const dx = Math.round(pending.x), dy = Math.round(pending.y);
+    pending.x -= dx; pending.y -= dy;  // 保留小数余量
+    if (!dx && !dy) return;
     pywebviewApi().then((a) => { if (a && a.move_by) a.move_by(dx, dy); });
   }
   document.querySelector(".tb").addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
-    if (e.target.closest("button, a")) return;
-    drag = { lx: e.screenX, ly: e.screenY };
+    if (e.target.closest("button, a, #user-menu")) return;
+    drag = { lx: e.screenX, ly: e.screenY, dpr: window.devicePixelRatio || 1 };
     pending = { x: 0, y: 0 };
     e.preventDefault();
   });
   window.addEventListener("mousemove", (e) => {
     if (!drag) return;
-    pending.x += e.screenX - drag.lx;
-    pending.y += e.screenY - drag.ly;
+    if (!(e.buttons & 1)) { cancelDrag(); return; }  // 按键已释放(mouseup 丢失): 终止幽灵拖动
+    pending.x += (e.screenX - drag.lx) * drag.dpr;
+    pending.y += (e.screenY - drag.ly) * drag.dpr;
     drag.lx = e.screenX;
     drag.ly = e.screenY;
     if (!rafId) rafId = requestAnimationFrame(flushDrag);
   });
-  window.addEventListener("mouseup", () => {
-    drag = null;
-    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
-    flushDrag();
-  });
+  window.addEventListener("mouseup", cancelDrag);
+  window.addEventListener("blur", cancelDrag);  // alt-tab/弹窗抢焦点时 mouseup 会丢
 }
 
 /* ---------------- 窗口边缘调整大小 ----------------
    frameless 窗口在 Windows 上失去系统边框, 系统不再提供边缘拖拽, 因此在前端
    捕获窗口边缘的拖拽并在后端用 SetWindowPos 实现 (与标题栏拖动 move_by 同源):
    mousedown 用捕获阶段先于标题栏拖动逻辑触发, 命中边缘时 stopPropagation 阻止
-   窗口拖动; mousemove 累积屏幕像素增量, 用 rAF 合并后调用 resize_by。 */
+   窗口拖动; mousemove 累积增量 (DIP × devicePixelRatio → 物理像素, 同 move_by),
+   rAF 合并后调用 resize_by。 */
 const RESIZE_EDGE_PX = 6;
 const EDGE_CURSOR = {
   n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize",
@@ -437,7 +452,8 @@ const EDGE_CURSOR = {
 };
 let resizeEdge = "";
 let resizeLast = { lx: 0, ly: 0 };
-let resizePending = { x: 0, y: 0 };
+let resizePending = { x: 0, y: 0 };  // 物理像素 (含小数余量)
+let resizeDpr = 1;
 let resizeRaf = null;
 
 function edgeAt(x, y) {
@@ -451,11 +467,18 @@ function edgeAt(x, y) {
 }
 function flushResize() {
   resizeRaf = null;
-  if (!resizeEdge || (resizePending.x === 0 && resizePending.y === 0)) return;
-  const dx = resizePending.x, dy = resizePending.y;
+  if (!resizeEdge || (!resizePending.x && !resizePending.y)) return;
+  const dx = Math.round(resizePending.x), dy = Math.round(resizePending.y);
+  resizePending.x -= dx; resizePending.y -= dy;  // 保留小数余量
+  if (!dx && !dy) return;
   const edge = resizeEdge;
-  resizePending = { x: 0, y: 0 };
   pywebviewApi().then((a) => { if (a && a.resize_by) a.resize_by(edge, dx, dy); });
+}
+function cancelResize() {
+  if (!resizeEdge) return;
+  resizeEdge = "";
+  if (resizeRaf) { cancelAnimationFrame(resizeRaf); resizeRaf = null; }
+  flushResize();
 }
 function bindWindowResize() {
   window.addEventListener("mousemove", (e) => {
@@ -463,9 +486,10 @@ function bindWindowResize() {
       document.documentElement.style.cursor = EDGE_CURSOR[edgeAt(e.clientX, e.clientY)] || "";
       return;
     }
+    if (!(e.buttons & 1)) { cancelResize(); return; }  // mouseup 丢失兜底
     document.documentElement.style.cursor = EDGE_CURSOR[resizeEdge] || "";
-    resizePending.x += e.screenX - resizeLast.lx;
-    resizePending.y += e.screenY - resizeLast.ly;
+    resizePending.x += (e.screenX - resizeLast.lx) * resizeDpr;
+    resizePending.y += (e.screenY - resizeLast.ly) * resizeDpr;
     resizeLast.lx = e.screenX;
     resizeLast.ly = e.screenY;
     if (!resizeRaf) resizeRaf = requestAnimationFrame(flushResize);
@@ -475,17 +499,14 @@ function bindWindowResize() {
     const edge = edgeAt(e.clientX, e.clientY);
     if (!edge) return;
     resizeEdge = edge;
+    resizeDpr = window.devicePixelRatio || 1;
     resizeLast = { lx: e.screenX, ly: e.screenY };
     resizePending = { x: 0, y: 0 };
     e.preventDefault();
     e.stopPropagation();  // 阻止标题栏拖动
   }, true);  // 捕获阶段: 先于 .tb 的 mousedown
-  window.addEventListener("mouseup", () => {
-    if (!resizeEdge) return;
-    resizeEdge = "";
-    if (resizeRaf) { cancelAnimationFrame(resizeRaf); resizeRaf = null; }
-    flushResize();
-  });
+  window.addEventListener("mouseup", cancelResize);
+  window.addEventListener("blur", cancelResize);
 }
 
 /* ---------------- 主题 / 货币 ---------------- */
@@ -565,14 +586,22 @@ function renderUsageBlocks(quota) {
   if (!quota || !quota.success) {
     if (quota && !quota.success) {
       clearTimeout(state.quotaRetryTimer);
+      state.quotaRetryCount = 0;
       row.innerHTML = `<div class="ub ub-error">${t("quotaFail")}：${escapeHtml(quota.error || "?")}，${t("retryTip")}</div>`;
       return;
     }
+    // quota 为 null (未登录/接口不可用): 有限次重试, 避免每 5 秒永久轮询
     if (state.quotaRetryTimer) clearTimeout(state.quotaRetryTimer);
+    if ((state.quotaRetryCount || 0) >= 5) {
+      state.quotaRetryCount = 0;
+      return;  // 停止重试, 保留骨架; 下次 loadDashboard 会重新开始
+    }
+    state.quotaRetryCount = (state.quotaRetryCount || 0) + 1;
     state.quotaRetryTimer = setTimeout(() => loadDashboard(true), 5000);
     row.innerHTML = `<div class="ub skeleton"><div class="sk-line w40"></div><div class="sk-line w20 lg"></div><div class="sk-bar"></div><div class="sk-line w60"></div></div>`.repeat(3);
     return;
   }
+  state.quotaRetryCount = 0;
   if (state.quotaRetryTimer) { clearTimeout(state.quotaRetryTimer); state.quotaRetryTimer = null; }
   // API Key 模式上游不返回 monthlyCreditsGranted, 后端回落到套餐映射 —— UI 需标明
   const monthlyEstimated = quota.monthly_granted_from_plan === true;
@@ -585,7 +614,7 @@ function renderUsageBlocks(quota) {
     const note = w.label === "Monthly" && monthlyEstimated ? ` · ${t("planEstimated")}` : "";
     blocks.push(`
       <div class="ub ${QUOTA_CLS[w.label] || "c-month"}">
-        <div class="ub-head"><span class="ub-l">${(QUOTA_LABEL[w.label] || (() => w.label))()}</span><span class="ub-rem">${t("remaining")} ${fmtMoney(w.remaining)}</span></div>
+        <div class="ub-head"><span class="ub-l">${(QUOTA_LABEL[w.label] || (() => escapeHtml(w.label)))()}</span><span class="ub-rem">${t("remaining")} ${fmtMoney(w.remaining)}</span></div>
         <div class="ub-bar"><div class="ub-bar-fill" style="width:${pct}%"></div></div>
         <div class="ub-meta"><span>${t("used")} ${fmtMoney(w.used)} / ${fmtMoney(w.total)} · ${fmtPercent(pct)}${note}</span><span>${reset}</span></div>
       </div>`);
@@ -800,7 +829,7 @@ async function loadDays() {
         <td class="num">${fmtMs(d.avg_duration_ms)}</td>
         <td class="num">${fmtMoney(d.total_cost_usd)}</td></tr>`).join("");
       if (data.records.length < PAGE) {
-        html += ('<tr>' + '<td>&nbsp;</td>'.repeat(8) + '</tr>').repeat(PAGE - data.records.length);
+        html += ('<tr>' + '<td>&nbsp;</td>'.repeat(8) + '</tr>').repeat(Math.max(0, PAGE - data.records.length));
       }
       body.innerHTML = html;
     }
@@ -829,6 +858,11 @@ async function loadRecords() {
     const sel = $("rec-model-filter");
     sel.innerHTML = '<option value="">' + t("allModels") + '</option>' + data.models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("");
     sel.value = state.records.model || "";
+    if (sel.value !== (state.records.model || "")) {
+      // 当前筛选的模型已不在列表中 (被清理/改名): 同步回 state, 避免界面与查询条件脱节
+      state.records.model = "";
+      state.records.page = 1;
+    }
     const ssel = $("rec-status-filter");
     if (ssel) ssel.value = state.records.status || "";
     $("rec-count").textContent = `${t("totalN")} ${fmtInt(data.total)} ${t("items")}`;
@@ -848,7 +882,7 @@ async function loadRecords() {
         <td class="num">${fmtMoney(r.cost_usd)}</td></tr>`;
       }).join("");
       if (data.records.length < PAGE) {
-        html += ('<tr>' + '<td>&nbsp;</td>'.repeat(8) + '</tr>').repeat(PAGE - data.records.length);
+        html += ('<tr>' + '<td>&nbsp;</td>'.repeat(8) + '</tr>').repeat(Math.max(0, PAGE - data.records.length));
       }
       body.innerHTML = html;
     }
@@ -884,10 +918,16 @@ function modelIcon(m) {
     if (re.test(s)) { name = icon; break; }
   }
   const themed = dark && ["gpt", "grok", "mimo"].includes(name) ? `${name}-color` : name;
-  return `<img src="icons/${themed}.svg" alt="${escapeHtml(m)}" title="${escapeHtml(m)}" style="width:16px;height:16px">`;
+  return `<img src="icons/${themed}.svg" alt="${escapeHtml(m)}" title="${escapeHtml(m)}" data-model="${escapeHtml(m)}" style="width:16px;height:16px">`;
 }
 function refreshIcons() {
   if (!document.getElementById("page-stats").hidden) chartModel(state.data?.models);
+  // 记录页的模型图标带主题变体 (暗色 -color.svg), 切主题时就地重建
+  if (!document.getElementById("page-records").hidden) {
+    document.querySelectorAll("#records-body img[data-model]").forEach((img) => {
+      img.outerHTML = modelIcon(img.dataset.model);
+    });
+  }
 }
 
 /* ---------------- 组装 ---------------- */
@@ -941,9 +981,11 @@ async function startSync(mode) {
 }
 function pollUntilIdle() {
   if (state.syncTimer) clearInterval(state.syncTimer);
+  let failures = 0;
   state.syncTimer = setInterval(async () => {
     try {
       const st = await api("/api/state");
+      failures = 0;
       renderSyncBanner(st.progress);
       renderSettingsSyncProgress(st.progress);
       if (!st.progress.running) {
@@ -954,7 +996,15 @@ function pollUntilIdle() {
         if (state.page === "settings") renderSettings();
         if (state.page === "overview") loadOverview(true).catch(() => {});
       }
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      // /api/state 持续不可达: 退出轮询并恢复按钮, 避免永久禁用
+      if (++failures >= 4) {
+        clearInterval(state.syncTimer); state.syncTimer = null;
+        $("tb-refresh").disabled = false;
+        $("btn-full-sync").disabled = false;
+        toast(t("loadFailed"), "err");
+      }
+    }
   }, 2500);
 }
 function renderSyncBanner(progress) {
@@ -1038,7 +1088,7 @@ function renderAccountCard(a) {
     quotaHtml = `<div class="ov-quota-grid">${q.windows.map((w) => {
       const pct = Math.max(0, Math.min(100, Number(w.used_percent) || 0));
       return `<div class="ub ${QUOTA_CLS[w.label] || "c-month"} ov-ub">
-        <div class="ub-head"><span class="ub-l">${(QUOTA_LABEL[w.label] || (() => w.label))()}</span><span class="ub-rem">${t("remaining")} ${fmtMoney(w.remaining)}</span></div>
+        <div class="ub-head"><span class="ub-l">${(QUOTA_LABEL[w.label] || (() => escapeHtml(w.label)))()}</span><span class="ub-rem">${t("remaining")} ${fmtMoney(w.remaining)}</span></div>
         <div class="ub-bar"><div class="ub-bar-fill" style="width:${pct}%"></div></div>
         <div class="ub-meta"><span>${t("used")} ${fmtMoney(w.used)} / ${fmtMoney(w.total)}</span><span>${w.reset_in_sec > 0 ? t("resetsIn") + " " + fmtDur(w.reset_in_sec) : fmtPercent(pct)}</span></div>
       </div>`;
@@ -1047,7 +1097,7 @@ function renderAccountCard(a) {
     quotaHtml = `<div class="ov-quota-empty">${q && q.error ? escapeHtml(t("quotaFail") + "：" + q.error) : t("quotaNotReady")}</div>`;
   }
   const tt = a.today || {};
-  const spark = sparklineSvg((a.today_trend || []).map((d) => d.input + d.output), a.color);
+  const spark = sparklineSvg((a.today_trend || []).map((d) => (Number(d.input) || 0) + (Number(d.output) || 0)), a.color);
   // 套餐名优先用后端映射 (quota.plan_name), 回退到前端兜底表/原始 planId
   const plan = q?.plan_name || (q?.plan_id ? (PLAN_NAMES[q.plan_id] || q.plan_id) : "");
   return `<div class="card ov-acc">
@@ -1352,7 +1402,7 @@ function promptApiKey(mode = "relogin") {
     okText: t("ok"),
     onOk: async () => {
       const value = key.trim();
-      if (!value) { toast(t("apikeyEmpty"), "err"); return; }
+      if (!value) { toast(t("apikeyEmpty"), "err"); return false; }  // 校验未过: 留在弹窗
       try {
         await api(`/api/login/apikey?mode=${mode}`, {
           method: "POST",
@@ -1399,14 +1449,20 @@ function showLoginOverlay(show) {
     loginPollTimer = null;
   }
 }
+let stateRetryCount = 0;
 async function checkState() {
   try {
     const st = await api("/api/state");
+    stateRetryCount = 0;
     if (!st.logged_in) { showLoginOverlay(true); return; }
     showLoginOverlay(false);
     if (st.progress && st.progress.running) pollUntilIdle();
     await loadDashboard();
-  } catch (e) { console.error("state check failed", e); }
+  } catch (e) {
+    console.error("state check failed", e);
+    // 启动时后端尚未就绪: 有限次自动重试, 避免首屏永久空白
+    if (++stateRetryCount <= 10) setTimeout(checkState, 3000);
+  }
 }
 
 /* 登录成功通知 (后端 evaluate_js 触发): 就地刷新数据/顶栏/账户列表 */
@@ -1465,7 +1521,7 @@ function bindEvents() {
         desc.textContent = `${t("updateFound")} ${r.latest}`;
         showModal({
           title: t("updateFound"),
-          message: `<b>${r.latest}</b> (${t("currentVersion")} v${r.current})<br><br>${escapeHtml((r.notes || "").slice(0, 300)) || ""}`,
+          message: `<b>${escapeHtml(r.latest)}</b> (${t("currentVersion")} v${escapeHtml(r.current)})<br><br>${escapeHtml((r.notes || "").slice(0, 300)) || ""}`,
           okText: t("goDownload"),
           onOk: () => { api("/api/update/open", { method: "POST" }).catch(() => {}); },
         });
@@ -1572,6 +1628,10 @@ function rerenderCharts() {
   if (!document.getElementById("page-stats").hidden) {
     chartModel(state.data.models);
     chartTrend(state.data.trend);
+  }
+  if (!document.getElementById("page-overview").hidden) {
+    // 总览页: 账号卡片已渲染过时重建 (chartOvTrend 依赖 accounts, 从卡片数据重取)
+    loadOverview(true).catch(() => {});
   }
 }
 
