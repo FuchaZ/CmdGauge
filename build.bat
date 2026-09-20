@@ -17,6 +17,7 @@ python scripts\build_icon.py || goto :err
 echo [3/4] 打包单文件 exe (无控制台窗口, logo 图标)...
 echo       裁剪误收集依赖 (numpy/cryptography/PIL._avif), 体积约减半
 pyinstaller --noconfirm --clean --onefile --noconsole --name CmdGauge ^
+  --distpath . ^
   --add-data "app\web;app\web" ^
   --add-data "assets;assets" ^
   --icon assets\CmdGauge.ico ^
@@ -31,7 +32,7 @@ pyinstaller --noconfirm --clean --onefile --noconsole --name CmdGauge ^
 
 echo [4/4] 完成!
 echo.
-echo 输出: dist\CmdGauge.exe
+echo 输出: CmdGauge.exe (项目根目录, 与 data\ 同级)
 echo 数据目录: 首次运行会在 exe 同目录创建 data\ 文件夹
 echo.
 pause

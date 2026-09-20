@@ -6,6 +6,9 @@ build/
 __pycache__/
 *.pyc
 
+# 打包产物: v1.0.4 起 exe 直接输出到项目根 (见 build.bat 的 --distpath)
+/CmdGauge.exe
+
 # 开发/测试
 tests/evidence/
 .pytest_cache/

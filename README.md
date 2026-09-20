@@ -77,7 +77,7 @@ python entry.py
 build.bat
 ```
 
-输出 `dist\CmdGauge.exe`（`--noconsole` 无黑窗，含 logo 图标与托盘支持）。
+输出 `CmdGauge.exe`（**项目根目录**，与 `data` 同级；`--noconsole` 无黑窗，含 logo 图标与托盘支持）。
 
 ### 测试
 
