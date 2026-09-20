@@ -199,3 +199,35 @@ UI 对月度卡标注「额度按套餐估算」）；两模式的 5h/weekly/mon
 - UI `sessionBadgeHtml()`：设置页账号行与总览卡片显示「登录剩余 N 天」，≤4 天标黄、≤2 天标红、已过期标红；API Key 账号不显示
 - 非活跃账号补 `relogin`：前端先 `switch` 再拉起登录窗 —— 因为 `db.save_token` 作用于**活跃账号**，不切会把新凭证盖到别的账号上
 - `startLoginWatch` 的变更签名加入 `updated_at`，否则重登一个「本来就有 token」的账号时检测不到登录完成
+
+## 9. 托盘与关闭行为（v1.0.4）
+
+### 现象
+
+点标题栏的 × 会**直接退出进程**，而不是隐藏到托盘；期望是「关闭 → 托盘，完全退出走托盘右键」。
+
+### 排查过程（两次自我推翻，都靠实测）
+
+1. 第一反应是「原生关闭路径没被拦截」——`main.py` 只绑了 `closed`（关闭后），没绑 `closing`（关闭前），于是补了 `main_win.events.closing` + handler 返回 `True`。
+2. **实测推翻**：独立探针发 `WM_CLOSE` 得到 `TRUE_DOES_NOT_CANCEL`（handler 确实被调用了，但窗口照样销毁）。根因在 pywebview 自身：
+
+   ```python
+   # webview/event.py  Event.set()
+   def execute():
+       for func in self._items:
+           value = func()              # handler 在**新线程**里跑
+           return_values.add(value)
+   if len(self._items):
+       t = threading.Thread(target=execute); t.start()   # 异步
+   false_values = [v for v in return_values if v is False]   # ← 此刻集合还是空的
+   return len(false_values) != 0                              # → 恒为 False
+   ```
+   `should_cancel` 恒为 `False` → `winforms.py` 里的 `args.Cancel = True` **永远不会执行**。返回 `True` 还是 `False` 都没用。
+3. **改用 `win.native` 的 .NET `FormClosing` 订阅**（`BrowserForm` 是 WinForms `Form`，事件在 UI 线程**同步**触发）：实测 `FORMCLOSING_CANCELS`，窗口存活。
+
+### 实现
+
+- `_install_close_to_tray(win)`：`form.FormClosing += handler`；handler 里先 `form.Hide()`，成功后才 `args.Cancel = True`（隐藏失败就放行，否则窗口关不掉、托盘又没有 → 只能杀进程）；`_quitting` 或 `_tray_ready` 为假时直接放行
+- `_install_close_to_tray_when_ready(win)`：`win.native` 由 pywebview 在 `webview.start()` 内部创建，所以借 `webview.start(func)` 的后台钩子安装，带 5 秒重试
+- `TrayIcon.start()`：`_tray_ready` 不再「启动线程后立即置 True」，改为轮询 `icon.visible`（3 秒超时）；图标缺失与超时都落 `_mlog`
+- `_mlog` 只写文件且静默吞 `OSError`；**`tempfile.gettempdir()` 优先读 `TMPDIR`**，脚本里想控制日志落点必须同时设 `TEMP`/`TMP`/`TMPDIR`

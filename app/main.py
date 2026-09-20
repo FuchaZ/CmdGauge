@@ -242,6 +242,10 @@ class TrayIcon:
             import pystray
 
             if not os.path.isfile(self._icon_path):
+                # 原实现这里静默 return False, 而 _tray_ready 初值就是 False,
+                # 结果表现为「点 × 直接退出进程」且日志里毫无线索。必须留痕。
+                _mlog(f"[tray] 图标文件不存在, 托盘不可用: {self._icon_path}")
+                _tray_ready = False
                 return False
             img = Image.open(self._icon_path).convert("RGBA")
             menu = pystray.Menu(
@@ -251,12 +255,29 @@ class TrayIcon:
             )
             self._icon = pystray.Icon("CmdGauge", img, "CmdGauge - Command Code 用量面板", menu)
             threading.Thread(target=self._icon.run, daemon=True).start()
-            _tray_ready = True
-            return True
+            # 只在线程真的把图标画出来之后才算就绪: `icon.run` 是异步的, 原来
+            # 启动后立刻置 True, 若图标实际没显示出来, 窗口 hide() 之后就再没有
+            # 入口能把它叫回来, 用户只能去任务管理器杀进程。
+            _tray_ready = self._wait_visible()
+            if not _tray_ready:
+                _mlog("[tray] 托盘图标未在超时内可见, 关闭窗口将直接退出")
+            return _tray_ready
         except Exception as exc:  # noqa: BLE001
-            print(f"[tray] 托盘启动失败: {exc}", flush=True)
+            _mlog(f"[tray] 托盘启动失败: {exc}")
             _tray_ready = False
             return False
+
+    def _wait_visible(self, timeout: float = 3.0) -> bool:
+        """轮询 pystray 的 ``visible`` 属性, 确认托盘图标真的显示出来了.
+
+        实测图标在 0.25s 内即可见, 所以正常路径几乎不产生额外启动延迟。
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if getattr(self._icon, "visible", False):
+                return True
+            time.sleep(0.1)
+        return bool(getattr(self._icon, "visible", False))
 
     def stop(self) -> None:
         if self._icon:
@@ -393,9 +414,11 @@ class WindowApi:
         if not self._win:
             return True
         if _quitting or not _tray_ready:
+            _mlog(f"  [close] real quit (quitting={_quitting}, tray_ready={_tray_ready})")
             self._win.destroy()
         else:
             self._win.hide()  # 最小化到托盘
+            _mlog("  [close] hidden to tray")
         return True
 
     def quit(self) -> bool:
@@ -413,6 +436,60 @@ def _destroy_all_windows() -> None:
             w.destroy()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _install_close_to_tray(win) -> bool:
+    """在 WinForms 层订阅 `FormClosing`, 把「关闭」改写成「隐藏到托盘」.
+
+    **不要用 pywebview 自带的 `closing` 事件**: `Event.set()` 把 handler 丢进
+    新线程异步执行, 却**立刻**读取返回值 (webview/event.py 的
+    `false_values = [v for v in return_values if v is False]`), 此时集合还是空的,
+    于是 `should_cancel` 恒为 False、`args.Cancel` 永远不被赋值 —— 无论 handler
+    返回 True 还是 False 都拦不住关闭。实测结论: `TRUE_DOES_NOT_CANCEL`。
+
+    改为直接订阅 .NET 的 `FormClosing`: 它在 UI 线程**同步**触发,
+    `args.Cancel = True` 一定生效 (实测结论: `FORMCLOSING_CANCELS`)。
+    这样 Alt+F4 / 任务栏缩略图关闭 / 系统菜单关闭都会合并到「隐藏到托盘」。
+    """
+    try:
+        form = getattr(win, "native", None)
+        if form is None:
+            _mlog("[close] win.native 不可用, 无法安装原生关闭拦截")
+            return False
+
+        def on_form_closing(sender, args) -> None:  # noqa: ARG001 .NET 事件签名
+            if _quitting or not _tray_ready:
+                return  # 放行: 托盘不可用或正在退出, 必须能真正关掉
+            try:
+                form.Hide()
+            except Exception as exc:  # noqa: BLE001
+                # 藏不住就别拦, 否则窗口关不掉、托盘也没有 → 只能杀进程
+                _mlog(f"[close] FormClosing hide failed: {exc}")
+                return
+            args.Cancel = True
+            _mlog("[close] native close intercepted -> hidden to tray")
+
+        form.FormClosing += on_form_closing
+        _mlog("[close] FormClosing interceptor installed")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _mlog(f"[close] 安装 FormClosing 拦截失败: {exc}")
+        return False
+
+
+def _install_close_to_tray_when_ready(win, timeout: float = 5.0) -> None:
+    """等 ``win.native`` 就绪后再装拦截.
+
+    `native` 由 pywebview 在 `webview.start()` 内部创建, 所以这个函数是交给
+    `webview.start(func)` 当后台钩子调用的。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if getattr(win, "native", None) is not None:
+            if _install_close_to_tray(win):
+                return
+        time.sleep(0.1)
+    _mlog("[close] 超时: 未能安装 FormClosing 拦截 (关闭窗口仍会退出进程)")
 
 
 def main() -> None:
@@ -630,14 +707,18 @@ def main() -> None:
     except OSError as exc:
         _mlog(f"[main] webview storage 目录不可用, 回退临时 profile: {exc}")
         storage = ""
+    # 「关闭→托盘」的拦截要等 WinForms 窗口真正建好 (win.native 才有值), 而那已经
+    # 是 webview.start() 内部的事了 —— 所以借它的后台 func 钩子来装。
+    install_close_hook = lambda: _install_close_to_tray_when_ready(main_win)  # noqa: E731
     if storage:
         webview.start(
+            install_close_hook,
             icon=icon_path if os.path.isfile(icon_path) else None,
             private_mode=False,
             storage_path=storage,
         )
     else:
-        webview.start(icon=icon_path if os.path.isfile(icon_path) else None)
+        webview.start(install_close_hook, icon=icon_path if os.path.isfile(icon_path) else None)
 
     if not _quitting:
         tray.stop()

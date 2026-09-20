@@ -2,6 +2,16 @@
 
 > 每个版本对应一个 GitHub Release；exe 一律在 `app/__init__.py` 的 `__version__` 改完之后重新打包。
 
+## v1.0.4
+
+**托盘与关闭行为修正**
+
+- **点 × 不再直接退出进程**：关闭窗口统一改为隐藏到系统托盘，「完全退出」走托盘图标右键菜单
+- 拦截原生关闭：Alt+F4 / 任务栏缩略图关闭 / 窗口系统菜单关闭，同样合并为「隐藏到托盘」
+- **修复托盘就绪判定**：原实现启动托盘线程后**立刻**认为托盘可用，若图标实际没显示出来，窗口一隐藏就再没有入口能叫回来（用户只能去任务管理器杀进程）；现在等 pystray 的 `icon.visible` 真正为真才置 `_tray_ready`（3 秒超时并落日志）
+- 托盘图标文件缺失不再静默失败，改为写入 `%TEMP%\cmdgauge_main.log`；`close()` 的两个分支也各记一条日志，便于日后定位
+- **技术要点（别再踩）**：不要用 pywebview 的 `closing` 事件来取消关闭 —— `Event.set()` 把 handler 丢进**新线程**异步执行，却**立即**读取返回值，`args.Cancel` 永远不会被赋值（实测结论 `TRUE_DOES_NOT_CANCEL`）。正确做法是订阅 `win.native`（WinForms `BrowserForm`）的 .NET `FormClosing`，它在 UI 线程同步触发（实测结论 `FORMCLOSING_CANCELS`）
+
 ## v1.0.3
 
 **多账号配额全覆盖 + 会话保活**
