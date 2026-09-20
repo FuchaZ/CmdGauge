@@ -79,7 +79,8 @@ def _rec(usg_id, inp=10):
 
 def main() -> int:
     global _host, _port
-    _host, _port = server.start_server(port=0)
+    # with_scheduler=False: 调度线程会真实访问上游, 冒烟测试必须隔离掉
+    _host, _port = server.start_server(port=0, with_scheduler=False)
     print(f"server at {_host}:{_port}, data={_tmpdir}")
 
     # 1. 全新库初始态
@@ -184,6 +185,20 @@ def main() -> int:
     check("bad sync mode -> 400", st == 400)
     st, _ = call("GET", "/api/definitely-not-a-route")
     check("unknown api route -> 404", st == 404)
+
+    # 13. 调度器: 配额刷新覆盖**全部**已登录账号 (旧实现只刷活跃账号)
+    server._quota_cache.clear()
+    refreshed = server._refresh_all_quotas()
+    logged_in_ids = {a["id"] for a in db.list_accounts() if a["has_token"]}
+    check("scheduler refreshes every logged-in account",
+          refreshed == len(logged_in_ids) and set(server._quota_cache) == logged_in_ids,
+          f"refreshed={refreshed} cache={set(server._quota_cache)} want={logged_in_ids}")
+    check("scheduler settings follow db settings", server._scheduler_settings() == (True, 60),
+          str(server._scheduler_settings()))
+    st, stx = call("GET", "/api/state")
+    check("state exposes scheduler snapshot",
+          isinstance(stx.get("scheduler"), dict) and "last_sync_at" in stx["scheduler"],
+          str(stx.get("scheduler"))[:120])
 
     print(f"\nresult: {PASS} passed, {FAIL} failed")
     return 0 if FAIL == 0 else 1

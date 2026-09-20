@@ -44,6 +44,11 @@ PATH_ORGS = "/internal/orgs"
 PATH_MODELS = "/internal/models"
 PATH_PROFILE = "/internal/profile/{login}"
 
+# better-auth 会话端点 (实测: basePath 是 /auth, 不是库默认的 /api/auth)。
+# GET 返回 {session, user} 或字面量 null。调用它本身就会触发服务端滑动续期
+# (站点等价配置 expiresIn=7d / updateAge=24h, 且续期不轮换 session_token)。
+PATH_AUTH_SESSION = "/auth/get-session"
+
 # /alpha/* 端点: 官方 CLI 使用, 仅接受 Authorization: Bearer <apiKey>
 PATH_ALPHA_WHOAMI = "/alpha/whoami"
 PATH_ALPHA_SUMMARY = "/alpha/usage/summary"
@@ -841,6 +846,63 @@ def fetch_quota(
             name=name, org_id=org_id or "", success=False,
             updated_at=now_iso, error=str(exc),
         )
+
+
+@dataclass
+class SessionInfo:
+    """better-auth 会话探测结果 (``/auth/get-session``).
+
+    status 取值:
+      - ``ok``      会话有效 (``expires_at`` 为服务端权威有效期)
+      - ``expired`` 服务端返回 null, 凭证已失效, 需要重新登录
+      - ``na``      该认证方式没有会话概念 (API Key)
+      - ``error``   网络/解析失败; **不能**据此判定凭证失效
+    """
+
+    status: str
+    expires_at: str = ""
+    updated_at: str = ""
+    user_name: str = ""
+    email: str = ""
+    org_id: str = ""
+    error: str = ""
+
+    @property
+    def authenticated(self) -> bool:
+        return self.status == "ok"
+
+
+def fetch_session_info(cred: str, auth_type: str = AUTH_COOKIE) -> SessionInfo:
+    """探测会话有效性, 并**顺带触发服务端滑动续期**.
+
+    站点为 better-auth 滑动会话 (``expiresIn=7d`` / ``updateAge=24h``): 只要任意
+    一次带 session 的请求落在 24 小时窗口外, 服务端就会把 expiresAt 顺延 7 天。
+    实测续期时 **session_token 不轮换**, 所以这里不需要读取响应的 Set-Cookie,
+    旧 cookie 串可以一直用下去。
+
+    所有失败都被转成 ``SessionInfo`` 而不是抛异常, 便于批量保活时逐账号汇报。
+    """
+    if auth_type == AUTH_APIKEY:
+        return SessionInfo(status="na", error="API Key 无会话过期概念")
+    try:
+        payload = _fetch(PATH_AUTH_SESSION, cred, auth_type)
+    except AuthError as exc:
+        return SessionInfo(status="expired", error=str(exc))
+    except CmdAPIError as exc:
+        return SessionInfo(status="error", error=str(exc))
+    if not payload:
+        # 未登录时端点返回 200 + 字面量 null
+        return SessionInfo(status="expired", error="会话为空, 需要重新登录")
+    session = payload.get("session") or {}
+    user = payload.get("user") or {}
+    return SessionInfo(
+        status="ok",
+        expires_at=str(session.get("expiresAt") or ""),
+        updated_at=str(session.get("updatedAt") or ""),
+        user_name=str(user.get("userName") or user.get("name") or ""),
+        email=str(user.get("email") or ""),
+        org_id=str(session.get("activeOrganizationId") or ""),
+    )
 
 
 def check_auth(cookie: str) -> tuple[bool, str]:

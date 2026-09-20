@@ -115,6 +115,7 @@ API 域名 `https://api.commandcode.ai`，存在**两套端点族**：
 - 聚合桶：每次同步都拉最近 1 天窗口，按 `(bucket_key, account_id)` **覆盖式** upsert 以累积历史。
 - 本地保留范围（30/60/90/180 天 / 所有）同时裁剪明细与桶。
 - API Key 账号跳过明细与桶同步，仅标记同步完成后由 dashboard 拉配额。
+- **定时由后端常驻调度线程驱动**（`cmdgauge-sched`），不再依赖前端 `setInterval`；每轮先**顺序刷新全部已登录账号的配额**（单账号失败不中断），再跑增量同步。会话保活另行每 6 小时探测一次，不受 `auto_sync` 开关影响。
 
 ## 5. 已验证 / 降级项
 
@@ -159,3 +160,42 @@ UI 对月度卡标注「额度按套餐估算」）；两模式的 5h/weekly/mon
 | settings 并发读-改-写丢更新 | 整包 JSON 无锁并发覆盖 | 新增 `_settings_lock` 串行化 `_persist_active` 与 `save_settings`；`get_active_account_id` 自动回落路径改「值变化才写」防写放大 |
 | 一个账号 cookie 过期 → 多账号自动同步整个卡死 | incremental 循环遇错即 return，剩余账号不再同步 | 改为继续同步全部账号，结束时汇总：全部失败 `ok=False`（同时修掉 full 模式唯一目标失败仍 `ok=True` 的假成功），部分失败 `ok=True, partial=True, errors=[...]` |
 | 杂项 | —— | 未知 /api 路由返回 JSON 404；请求体 Content-Length 加固（非法/超大 400，上限 1MiB）；handler `timeout=120` 防永久阻塞；汇率拉取失败只短路 5 分钟（原失败被当新鲜缓存 6 小时）并加并发去重锁；`_ensure_quota_async` 防重入检查原子化；`bool("false")` 严格转换；logout/delete 与在飞同步互斥（409）；前端：更新弹窗 `latest/current` 转义、quota null 重试上限、轮询持续失败自恢复、`repeat` 负数保护、模型筛选失联回退、sparkline NaN、`fmtMoney` 负数、主题切换后总览图表与记录页图标刷新、`showModal` onOk 可保持弹窗（API Key 空输入不再丢）、启动失败自动重试、`commandcode_api.py` 重复 `fetch_profile` 去重 |
+
+## 8. 多账号配额全覆盖 + 会话保活（v1.0.3）
+
+### 问题一：配额刷新只覆盖活跃账号，且定时器在前端
+
+`sync_all_async` 调的是无参 `_ensure_quota_async()`，而无参时只取 `get_active_account_id()`；其余账号配额唯一的新鲜化路径是**手动打开「账户总览」页**（只有 `/api/accounts/overview` 会逐账号触发）。更根本的是**定时器在前端**：自动同步由 `app.js` 的 `setInterval` 驱动（`POST /api/sync`），窗口最小化到系统托盘后 WebView2 会节流定时器 —— 同步与配额刷新一起停摆。
+
+**修复**：新增后端常驻调度线程 `cmdgauge-sched`（`server._scheduler_worker`）。
+
+| 任务 | 周期 | 受 `auto_sync` 控制 |
+|---|---|---|
+| 全账号配额刷新（顺序执行，单账号失败不中断） | `sync_interval_sec` | 是 |
+| 全账号增量同步 | `sync_interval_sec` | 是 |
+| 会话保活探测 | 6 小时 | **否**（关掉自动同步的账号同样会掉线） |
+
+- `PUT /api/settings` 后调 `wake_scheduler()` 立即打断等待重算，不必等下一个 tick
+- 手动 `POST /api/sync` 同时更新调度心跳，避免紧接着又自动同步一次
+- 前端定时器降级为**纯 UI 刷新**（只 `loadDashboard`，不再发 `/api/sync`）
+- `start_server(with_scheduler=False)` 供冒烟测试隔离（调度线程会真实访问上游）
+
+### 问题二：会话到期只能手动重登，且非活跃账号根本没法重登
+
+实测站点是 **better-auth 滑动会话**：
+
+| 字段 | 实测值 |
+|---|---|
+| `session.createdAt` | `2026-09-18T15:42:55Z` |
+| `session.updatedAt` | `2026-09-19T15:43:24Z`（= createdAt + 24h01m） |
+| `session.expiresAt` | `2026-09-26T15:43:24Z`（= updatedAt + 7d） |
+
+即 `expiresIn = 7d` / `updateAge = 24h`。续期响应**只下发 `session_data`（`Max-Age=300`），不轮换 `session_token`** —— 客户端**不需要**回写 `Set-Cookie`，旧 cookie 串可以一直用。端点真实路径是 `{API_BASE}/auth/get-session`（`basePath` 是 `/auth`），未登录时返回 `200` + 字面量 `null`。
+
+**实现**：
+- `commandcode_api.fetch_session_info()` → `SessionInfo(status=ok|expired|na|error)` + 权威 `expiresAt`；**调用它本身就是保活**
+- `accounts` 表新增 `session_expires_at` / `session_checked_at`（新建库建表 + 老库 `ALTER TABLE` 两条路径）
+- 探测失败只刷 `checked_at`、**保留上次已知有效期**（免得 UI 从「还剩 3 天」莫名退回「未知」）
+- UI `sessionBadgeHtml()`：设置页账号行与总览卡片显示「登录剩余 N 天」，≤4 天标黄、≤2 天标红、已过期标红；API Key 账号不显示
+- 非活跃账号补 `relogin`：前端先 `switch` 再拉起登录窗 —— 因为 `db.save_token` 作用于**活跃账号**，不切会把新凭证盖到别的账号上
+- `startLoginWatch` 的变更签名加入 `updated_at`，否则重登一个「本来就有 token」的账号时检测不到登录完成

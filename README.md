@@ -44,8 +44,9 @@
 - **使用记录**：请求级明细分页，支持模型 + 状态筛选，含耗时与单次费用
 - **内置 WebView 登录**：独立登录窗口打开 commandcode.ai 官方登录页，自动捕获会话凭证，无需手动复制
 - **API Key 登录（备选）**：不便用内置浏览器时可直接填 API Key；该通道受官方接口限制，只提供额度与汇总（UI 已明确标注）
-- **自动同步**：增量同步（1/5/15/30 分钟可选）+ 本地保留范围设置（30/60/90/180 天 / 所有）
-- **多账号**：顶栏一键切换、重命名、删除，账户总览聚合各账号配额与用量
+- **自动同步（后端常驻）**：增量同步（1/5/15/30 分钟可选）+ 本地保留范围设置（30/60/90/180 天 / 所有）。定时由后端守护线程驱动，窗口收进托盘后照常运行，且每轮刷新**全部账号**的配额（不只是当前活跃账号）
+- **多账号**：顶栏一键切换、重命名、删除，账户总览聚合各账号配额与用量；任意账号（含非活跃）都可单独重新登录
+- **会话保活与有效期**：后台定期探测会话并自动滚动续期，账号行与总览卡片显示「登录剩余 N 天」，临期标黄、过期标红
 - **双主题**：亮色 / 深色一键切换；中英双语界面
 - **系统托盘**：关闭窗口最小化到托盘
 - **本地优先**：所有数据保存在本机 SQLite，登录凭证仅用于同步官方接口
@@ -101,6 +102,7 @@ python scripts/smoke_multiuser.py  # 多账号端到端冒烟 (不触网)
 | 组织 | `GET /internal/orgs` | cookie |
 | 模型目录 | `GET /internal/models` | cookie |
 | 用户资料 | `GET /internal/profile/{login}` | cookie |
+| **会话探测 / 保活** | `GET /auth/get-session`（better-auth，非 `/internal` 族） | cookie |
 | 额度 / 订阅 / 汇总（API Key 模式） | `GET /alpha/billing/credits`、`/alpha/billing/subscriptions`、`/alpha/usage/summary`、`/alpha/whoami` | Bearer |
 
 ### 口径
@@ -121,6 +123,8 @@ python scripts/smoke_multiuser.py  # 多账号端到端冒烟 (不触网)
 | 明细项无 session / key / reasoning 维度 | 只有 token 数、三段成本与耗时。→ 「会话历史」改造为**「每日用量」** |
 | `/alpha/*` 无请求级明细 | 官方 CLI 只做聚合。→ API Key 模式**明确降级**：仅额度与汇总，不产生明细与缓存指标 |
 | 月度额度非 API 窗口字段 | API 无月度窗口对象，但直接给出 `monthlyCreditsGranted`，无需从套餐映射反推（套餐映射仅用于显示名称） |
+| 会话是 7 天滑动窗口 | better-auth 的 `expiresIn=7d` / `updateAge=24h`：24 小时内有过一次会话请求，服务端就把有效期顺延 7 天，且**不轮换 token**（实测 `updatedAt` 恰好比 `createdAt` 晚 24h01m、`expiresAt` = `updatedAt` + 7d）。→ 面板由后台线程定期调 `GET /auth/get-session` 保活；若连续 7 天完全离线（一次请求都没有），仍需重新登录 |
+| 会话端点不在默认 basePath | better-auth 默认挂在 `/api/auth/*`，但本站的 `basePath` 是 **`/auth`**：`/api/auth/get-session` 返回 404，`/auth/get-session` 才是真端点；未登录时返回 `200` + 字面量 `null`（而非 401） |
 
 ## 🔒 隐私
 

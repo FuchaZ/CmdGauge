@@ -223,6 +223,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
           org_id TEXT NOT NULL DEFAULT '',
           token TEXT NOT NULL DEFAULT '',
           auth_type TEXT NOT NULL DEFAULT 'cookie',
+          session_expires_at TEXT NOT NULL DEFAULT '',
+          session_checked_at TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -315,6 +317,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         ("login", "ALTER TABLE accounts ADD COLUMN login TEXT NOT NULL DEFAULT ''"),
         ("org_id", "ALTER TABLE accounts ADD COLUMN org_id TEXT NOT NULL DEFAULT ''"),
         ("auth_type", "ALTER TABLE accounts ADD COLUMN auth_type TEXT NOT NULL DEFAULT 'cookie'"),
+        (
+            "session_expires_at",
+            "ALTER TABLE accounts ADD COLUMN session_expires_at TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "session_checked_at",
+            "ALTER TABLE accounts ADD COLUMN session_checked_at TEXT NOT NULL DEFAULT ''",
+        ),
     ):
         if col not in acc_cols:
             conn.execute(ddl)
@@ -428,13 +438,22 @@ def set_active_account(account_id: int) -> bool:
 
 
 def _account_dict(row: sqlite3.Row) -> dict[str, Any]:
+    keys = row.keys()
     return {
         "id": row["id"],
         "name": row["name"],
         "login": row["login"] or "",
         "org_id": row["org_id"] or "",
-        "auth_type": (row["auth_type"] or "cookie") if "auth_type" in row.keys() else "cookie",
+        "auth_type": (row["auth_type"] or "cookie") if "auth_type" in keys else "cookie",
         "has_token": bool(row["token"].strip()),
+        # 会话有效期来自 better-auth /auth/get-session 的 session.expiresAt (权威值),
+        # 为空表示还没探测过 (例如 API Key 账号, 或刚登录尚未跑保活)
+        "session_expires_at": (
+            (row["session_expires_at"] or "") if "session_expires_at" in keys else ""
+        ),
+        "session_checked_at": (
+            (row["session_checked_at"] or "") if "session_checked_at" in keys else ""
+        ),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -478,7 +497,8 @@ def save_token(token: str, login: str = "", org_id: str = "", auth_type: str = "
     if not aid:
         return
     conn.execute(
-        """UPDATE accounts SET token = ?, login = ?, org_id = ?, auth_type = ?, updated_at = ?
+        """UPDATE accounts SET token = ?, login = ?, org_id = ?, auth_type = ?,
+                  session_expires_at = '', session_checked_at = '', updated_at = ?
            WHERE id = ?""",
         (token.strip(), (login or "").strip(), (org_id or "").strip(),
          auth_type or "cookie", _now_iso(), aid),
@@ -488,6 +508,40 @@ def save_token(token: str, login: str = "", org_id: str = "", auth_type: str = "
         "UPDATE usage_sync_state SET deepest_page_fetched = -1 WHERE account_id = ?", (aid,)
     )
     conn.commit()
+
+
+def save_session_info(account_id: int, expires_at: str = "", checked_at: str = "") -> None:
+    """记录会话有效期的权威值 (来自 better-auth ``/auth/get-session``).
+
+    - ``expires_at`` 非空: 一并更新有效期与探测时间
+    - ``expires_at`` 为空: 只刷新探测时间, **保留上次已知有效期**
+      (探测失败不该把已知信息擦掉, 否则 UI 会从"还剩 3 天"退回"未知")
+    """
+    conn = get_db()
+    aid = int(account_id)
+    now = (checked_at or "").strip() or _now_iso()
+    value = (expires_at or "").strip()
+    if value:
+        conn.execute(
+            "UPDATE accounts SET session_expires_at = ?, session_checked_at = ? WHERE id = ?",
+            (value, now, aid),
+        )
+    else:
+        conn.execute(
+            "UPDATE accounts SET session_checked_at = ? WHERE id = ?", (now, aid)
+        )
+    conn.commit()
+
+
+def get_session_info(account_id: int) -> tuple[str, str]:
+    """返回 ``(session_expires_at, session_checked_at)``, 未知时为两个空串."""
+    row = get_db().execute(
+        "SELECT session_expires_at, session_checked_at FROM accounts WHERE id = ?",
+        (int(account_id),),
+    ).fetchone()
+    if row is None:
+        return "", ""
+    return (row["session_expires_at"] or "", row["session_checked_at"] or "")
 
 
 def get_token() -> str:
@@ -629,7 +683,8 @@ def clear_account() -> None:
     conn.execute("DELETE FROM usage_buckets WHERE account_id = ?", (aid,))
     conn.execute("DELETE FROM account_summaries WHERE account_id = ?", (aid,))
     conn.execute(
-        "UPDATE accounts SET token = '', updated_at = ? WHERE id = ?",
+        "UPDATE accounts SET token = '', session_expires_at = '', session_checked_at = '',"
+        " updated_at = ? WHERE id = ?",
         (_now_iso(), aid),
     )
     _ensure_state_row(conn, aid)

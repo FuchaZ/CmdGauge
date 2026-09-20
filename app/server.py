@@ -23,6 +23,7 @@ from .commandcode_api import (
     fetch_chart_buckets,
     fetch_quota,
     fetch_quota_any,
+    fetch_session_info,
     fetch_usage_all,
     usage_page_url,
 )
@@ -169,6 +170,169 @@ def _ensure_quota_async(account_id: Optional[int] = None) -> None:
             db.close_thread_conn()  # worker 线程结束, 回收其 DB 连接
 
     threading.Thread(target=worker, daemon=True, name="cmdgauge-quota").start()
+
+
+# ---------------------------------------------------------------------------
+# 常驻调度线程: 后端驱动的自动同步 + 全账号配额刷新 + 会话保活
+#
+# 为什么要搬到后端: 原自动同步由前端 setInterval 驱动 (app/web/app.js), 窗口最小化
+# 到系统托盘后 WebView2 会节流定时器, 同步与配额刷新会一起停摆; 且原配额刷新只
+# 覆盖活跃账号 (_ensure_quota_async 无参时只取 active), 其余账号要手动打开
+# 「账户总览」页才会更新。
+# ---------------------------------------------------------------------------
+
+_SCHED_TICK_SEC = 60.0  # 调度心跳上限 (wake_scheduler 可提前打断)
+_SCHED_KEEPALIVE_SEC = 6 * 3600  # 会话保活探测间隔 (独立于 auto_sync 开关)
+_SCHED_MIN_INTERVAL = 30  # 与 db.save_settings 对 sync_interval_sec 的下界一致
+
+_sched_stop = threading.Event()
+_sched_wake = threading.Event()  # settings 变更/手动同步后唤醒, 立即重算间隔
+_sched_lock = threading.Lock()
+_sched_thread: Optional[threading.Thread] = None
+_sched_last: dict[str, float] = {"sync": 0.0, "keepalive": 0.0}
+_sched_info: dict[str, Any] = {
+    "last_sync_at": "",
+    "last_keepalive_at": "",
+    "keepalive": {},
+    "ticks": 0,
+}
+
+
+def _scheduler_settings() -> tuple[bool, int]:
+    """读取 (auto_sync, 间隔秒). 读失败退回默认值, 不让调度线程停摆."""
+    try:
+        settings = db.get_settings()
+    except Exception:  # noqa: BLE001
+        return True, 300
+    auto = settings.get("auto_sync") is not False
+    try:
+        interval = max(_SCHED_MIN_INTERVAL, int(settings.get("sync_interval_sec") or 300))
+    except (TypeError, ValueError):
+        interval = 300
+    return auto, interval
+
+
+def wake_scheduler() -> None:
+    """唤醒调度线程立即重算间隔 (非阻塞, 可在 HTTP handler 内安全调用)."""
+    _sched_wake.set()
+
+
+def scheduler_snapshot() -> dict[str, Any]:
+    """调度器状态快照 (供 /api/state 展示, 也是排查"自动同步是否在跑"的入口)."""
+    with _sched_lock:
+        return dict(_sched_info)
+
+
+def _refresh_all_quotas() -> int:
+    """顺序刷新**所有**已登录账号的配额缓存.
+
+    刻意同步执行 (不复用 _ensure_quota_async 的线程): 调度器本身就在后台线程里,
+    顺序刷新可避免 N 个账号同时打上游, 且单账号失败不影响其余。
+    """
+    refreshed = 0
+    for acc in db.list_accounts():
+        if not acc.get("has_token"):
+            continue
+        aid = int(acc["id"])
+        cred, login, org_id, auth_type = db.get_account_credentials(aid)
+        if not cred:
+            continue
+        try:
+            _fetch_quota_with_cache(
+                aid, cred, login, org_id, acc.get("name") or login or "Default", auth_type
+            )
+            refreshed += 1
+        except Exception:  # noqa: BLE001 单账号配额失败不中断整轮
+            continue
+    return refreshed
+
+
+def _keepalive_sessions() -> dict[str, Any]:
+    """逐个 cookie 账号探测会话 (顺带触发服务端滑动续期), 权威有效期落库.
+
+    站点是 better-auth 滑动会话 (expiresIn=7d / updateAge=24h), 且续期**不轮换**
+    session_token, 因此定期调一次 /auth/get-session 即可长期保活。API Key 账号
+    没有会话概念, 跳过。
+    """
+    summary: dict[str, Any] = {
+        "checked": 0, "ok": 0, "expired": 0, "error": 0, "expired_accounts": [],
+    }
+    for acc in db.list_accounts():
+        if not acc.get("has_token"):
+            continue
+        aid = int(acc["id"])
+        cred, _login, _org, auth_type = db.get_account_credentials(aid)
+        if not cred or auth_type == AUTH_APIKEY:
+            continue
+        info = fetch_session_info(cred, auth_type)
+        summary["checked"] += 1
+        if info.status == "ok":
+            summary["ok"] += 1
+            db.save_session_info(aid, info.expires_at)
+        else:
+            # 探测失败只刷新 checked_at: 保留上次已知有效期, 免得 UI 从
+            # 「还剩 3 天」莫名退回「未知」
+            db.save_session_info(aid, "")
+            if info.status == "expired":
+                summary["expired"] += 1
+                summary["expired_accounts"].append(acc.get("name") or f"#{aid}")
+            else:
+                summary["error"] += 1
+    return summary
+
+
+def _scheduler_worker() -> None:
+    """调度主循环: 会话保活 + (auto_sync 开启时) 全账号配额刷新与增量同步."""
+    try:
+        while not _sched_stop.is_set():
+            try:
+                auto, interval = _scheduler_settings()
+                now = time.time()
+
+                # 1) 会话保活: 刻意不受 auto_sync 影响 —— 关掉自动同步的账号同样会
+                #    在 7 天后静默掉线, 而"掉线要重登"正是本次要修的问题。
+                if now - _sched_last["keepalive"] >= _SCHED_KEEPALIVE_SEC:
+                    _sched_last["keepalive"] = now
+                    summary = _keepalive_sessions()
+                    with _sched_lock:
+                        _sched_info["last_keepalive_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        _sched_info["keepalive"] = summary
+
+                # 2) 自动同步: 先刷配额 (概览页依赖), 再拉用量明细
+                if auto and now - _sched_last["sync"] >= interval:
+                    _sched_last["sync"] = now
+                    _refresh_all_quotas()
+                    sync_usage("incremental")
+                    with _sched_lock:
+                        _sched_info["last_sync_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                with _sched_lock:
+                    _sched_info["ticks"] += 1
+            except Exception:  # noqa: BLE001 调度线程绝不因单轮异常退出
+                pass
+            _sched_wake.wait(_SCHED_TICK_SEC)
+            _sched_wake.clear()
+    finally:
+        db.close_thread_conn()  # 线程退出前回收其 DB 连接 (AGENT_HANDOVER §4.10)
+
+
+def start_scheduler() -> None:
+    """启动常驻调度线程 (幂等)."""
+    global _sched_thread
+    with _sched_lock:
+        if _sched_thread is not None and _sched_thread.is_alive():
+            return
+        _sched_stop.clear()
+        _sched_thread = threading.Thread(
+            target=_scheduler_worker, daemon=True, name="cmdgauge-sched"
+        )
+    _sched_thread.start()
+
+
+def stop_scheduler() -> None:
+    """通知调度线程退出 (不 join: 单轮网络调用可能仍在阻塞, 让它自然结束)."""
+    _sched_stop.set()
+    _sched_wake.set()
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +619,7 @@ def _handle_api(handler: BaseHTTPRequestHandler, path: str, query: dict[str, lis
                 "accounts_logged_in": db.count_logged_in_accounts(),
                 "sync": db.get_sync_state(),
                 "progress": _sync_progress_snapshot(),
+                "scheduler": scheduler_snapshot(),
                 "datadir": db.data_dir(),
                 "usage_page_url": usage_page_url(account.get("login", "")),
                 "version": __version__,
@@ -475,6 +640,8 @@ def _handle_api(handler: BaseHTTPRequestHandler, path: str, query: dict[str, lis
             _json_response(handler, {"ok": False, "error": "未登录"}, 401)
             return
         sync_all_async(mode)
+        # 手动触发也算一次心跳: 否则调度线程会在下一个 tick 上重复同步一遍
+        _sched_last["sync"] = time.time()
         _json_response(handler, {"ok": True})
         return
 
@@ -631,6 +798,8 @@ def _handle_api(handler: BaseHTTPRequestHandler, path: str, query: dict[str, lis
                     "login": acc.get("login", ""),
                     "auth_type": acc.get("auth_type", "cookie"),
                     "logged_in": True,
+                    "session_expires_at": acc.get("session_expires_at", ""),
+                    "session_checked_at": acc.get("session_checked_at", ""),
                     "active": aid == active_id,
                     "quota": slot.get("data") if slot else None,
                     "today": today,
@@ -795,7 +964,9 @@ def _handle_api(handler: BaseHTTPRequestHandler, path: str, query: dict[str, lis
         except Exception:  # noqa: BLE001
             _json_response(handler, {"ok": False, "error": "无效请求体"}, 400)
             return
-        _json_response(handler, db.save_settings(body))
+        saved = db.save_settings(body)
+        wake_scheduler()  # 间隔/开关变更立即生效, 不必等下一个 tick
+        _json_response(handler, saved)
         return
 
     _json_response(handler, {"ok": False, "error": "not found"}, 404)
@@ -885,17 +1056,26 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
-def start_server(host: str = "127.0.0.1", port: int = 0) -> tuple[str, int]:
-    """启动 HTTP 服务, 返回 (host, port)."""
+def start_server(
+    host: str = "127.0.0.1", port: int = 0, with_scheduler: bool = True
+) -> tuple[str, int]:
+    """启动 HTTP 服务, 返回 (host, port).
+
+    ``with_scheduler=False`` 只起 HTTP 层 (冒烟测试用): 调度线程会真实访问上游,
+    测试环境必须隔离掉。
+    """
     global _server
     _server = ThreadingHTTPServer((host, port), _Handler)
     thread = threading.Thread(target=_server.serve_forever, daemon=True, name="cmdgauge-http")
     thread.start()
+    if with_scheduler:
+        start_scheduler()  # 后端驱动的自动同步 / 全账号配额刷新 / 会话保活
     return _server.server_address[0], _server.server_address[1]
 
 
 def stop_server() -> None:
     global _server
+    stop_scheduler()
     if _server:
         _server.shutdown()
         _server.server_close()

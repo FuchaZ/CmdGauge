@@ -22,6 +22,8 @@ const I18N = {
     todayTotalReq: "今日总请求", todayTotalTokens: "今日总 TOKEN",
     todayTotalCost: "今日总费用", todayTotalInput: "今日总输入",
     activeAccount: "当前活跃", quotaNotReady: "额度获取中…",
+    sessionRemaining: "登录剩余 {n} 天", sessionExpired: "登录已过期",
+    sessionUnknown: "有效期未知", sessionValidUntil: "凭证有效期至 {date}",
     overviewPanel: "账户总览面板", overviewPanelDesc: "侧边栏显示多账户总览入口，聚合展示各账户配额与用量",
     setUpdate: "软件更新", currentVersion: "当前版本", checkUpdate: "检查更新",
     checkUpdateDesc: "检查 GitHub 上是否有新版本", checkUpdateBtn: "检查更新",
@@ -126,6 +128,8 @@ const I18N = {
     todayTotalReq: "Today Requests", todayTotalTokens: "Today Tokens",
     todayTotalCost: "Today Cost", todayTotalInput: "Today Input",
     activeAccount: "Active", quotaNotReady: "Fetching quota…",
+    sessionRemaining: "{n}d login left", sessionExpired: "Login expired",
+    sessionUnknown: "expiry unknown", sessionValidUntil: "Credentials valid until {date}",
     overviewPanel: "Accounts Panel", overviewPanelDesc: "Show multi-account overview entry in sidebar",
     setUpdate: "Software Update", currentVersion: "Current Version", checkUpdate: "Check Updates",
     checkUpdateDesc: "Check GitHub for new versions", checkUpdateBtn: "Check Updates",
@@ -1081,6 +1085,26 @@ function renderAccountOverview(data) {
     : `<div class="card ov-acc"><div class="ov-quota-empty">${t("noUsers")}</div></div>`;
 }
 
+/* 会话有效期徽章: 数据来自后端保活探测 (better-auth /auth/get-session 的 expiresAt)。
+   cookie 是 7 天滑动会话, 靠后台定期探测续期; 临近到期标黄, 已过期标红 —— 那
+   就意味着需要重新登录了。 */
+function sessionBadgeHtml(a) {
+  if (!a || a.auth_type === "apikey") return ""; // API Key 无会话概念
+  const exp = a.session_expires_at;
+  if (!exp) return `<span class="sess">${t("sessionUnknown")}</span>`;
+  const ms = Date.parse(exp) - Date.now();
+  if (!Number.isFinite(ms)) return "";
+  const days = ms / 86400000;
+  const title = t("sessionValidUntil").replace("{date}", exp.slice(0, 10));
+  if (days <= 0) return `<span class="sess danger" title="${escapeHtml(title)}">${t("sessionExpired")}</span>`;
+  const cls = days <= 2 ? "danger" : days <= 4 ? "warn" : "ok";
+  // 天数取整: 剩余 29.99 天该显示「30 天」而不是被 floor 成 29
+  const num = days >= 10 ? String(Math.round(days)) : days.toFixed(1);
+  const txt = t("sessionRemaining").replace("{n}", num);
+  return `<span class="sess ${cls}" title="${escapeHtml(title)}">${txt}</span>`;
+}
+
+
 function renderAccountCard(a) {
   let quotaHtml;
   const q = a.quota;
@@ -1103,7 +1127,7 @@ function renderAccountCard(a) {
   return `<div class="card ov-acc">
     <div class="ov-acc-head">
       <span class="ov-acc-name">${escapeHtml(a.name)}</span>
-      <span class="ov-acc-badges">${a.active ? `<span class="plan-badge">${t("activeAccount")}</span>` : ""}${plan ? `<span class="plan-badge">${escapeHtml(plan)}</span>` : ""}${a.auth_type === "apikey" ? `<span class="plan-badge">${t("authApikey")}</span>` : ""}</span>
+      <span class="ov-acc-badges">${a.active ? `<span class="plan-badge">${t("activeAccount")}</span>` : ""}${plan ? `<span class="plan-badge">${escapeHtml(plan)}</span>` : ""}${a.auth_type === "apikey" ? `<span class="plan-badge">${t("authApikey")}</span>` : ""}${sessionBadgeHtml(a)}</span>
       <span class="ov-acc-sync">${t("lastSync")} ${fmtRelative(a.last_sync_at)}</span>
     </div>
     ${quotaHtml}
@@ -1211,7 +1235,9 @@ function startLoginWatch() {
     if (Date.now() - startedAt > 5 * 60 * 1000) { stopLoginWatch(); return; }
     try {
       const r = await api("/api/accounts");
-      const sig = JSON.stringify((r.accounts || []).map((a) => [a.id, a.has_token, a.name])) + "|" + r.active_id;
+      // updated_at 也必须进签名: 重新登录一个"本来就有 token"的账号时 has_token 与
+      // name 都不变, 只有凭证时间戳会变 —— 不带它就检测不到登录已完成。
+      const sig = JSON.stringify((r.accounts || []).map((a) => [a.id, a.has_token, a.name, a.updated_at])) + "|" + r.active_id;
       if (!baseline) { baseline = sig; return; }
       if (sig !== baseline) {
         stopLoginWatch();
@@ -1290,12 +1316,13 @@ function renderUsersList(accounts, activeId) {
          <button class="btn" data-act="rename">${t("renameBtn")}</button>
          <button class="btn btn-danger" data-act="logout">${t("logout")}</button>`
       : `<button class="btn" data-act="switch">${t("switchTo")}</button>
+         <button class="btn" data-act="relogin">${t("relogin")}</button>
          <button class="btn" data-act="rename">${t("renameBtn")}</button>
          <button class="btn btn-danger" data-act="delete">${t("deleteUser")}</button>`;
     return `
     <div class="user-row${isActive ? " active" : ""}" data-id="${a.id}">
       <div class="ur-meta">
-        <div class="ur-name">${escapeHtml(a.name)}${isActive ? `<span class="badge ok ur-badge">${t("currentUserBadge")}</span>` : ""}</div>
+        <div class="ur-name">${escapeHtml(a.name)}${isActive ? `<span class="badge ok ur-badge">${t("currentUserBadge")}</span>` : ""}${sessionBadgeHtml(a)}</div>
         <div class="ur-ws">${escapeHtml(a.login || "—")} · ${t("loggedIn")} · ${a.auth_type === "apikey" ? t("authApikey") : t("authCookie")}</div>
       </div>
       <div class="ur-actions">${actions}</div>
@@ -1314,6 +1341,16 @@ async function onUserRowAction(id, act) {
     return;
   }
   if (act === "relogin") {
+    // 非活跃账号必须先切过去: 登录成功后 on_login_success 写入的是**活跃账号**的凭证
+    // (db.save_token 作用于 active_account_id), 不切就会把新凭证盖到别的账号上。
+    try {
+      const cur = await api("/api/accounts");
+      if (cur.active_id !== id) {
+        await api("/api/accounts/switch", { method: "POST", body: JSON.stringify({ id }) });
+        toast(t("switchedAccount"));
+        await loadDashboard();
+      }
+    } catch (e) { toast(e.message || t("loadFailed"), "err"); return; }
     startLoginWatch();
     const a = await pywebviewApi();
     if (a && a.open_login) { a.open_login("relogin"); return; }
@@ -1612,9 +1649,15 @@ function restartAutoSync() {
   if (autoSyncTimer) clearInterval(autoSyncTimer);
   if (state.settings.auto_sync === false) return;
   const sec = Math.max(30, Number(state.settings?.sync_interval_sec) || 300) * 1000;
-  autoSyncTimer = setInterval(() => {
-    const prog = state.data && state.data.progress;
-    if (!prog || !prog.running) startSync("incremental");
+  // 同步与配额刷新已由后端常驻调度线程负责 (app/server.py `_scheduler_worker`):
+  // 窗口最小化到托盘后 WebView2 会节流 setInterval, 前端定时器撑不起同步职责,
+  // 而且它只能刷新"活跃账号"的配额。这里只按同一间隔把最新数据拉回界面。
+  autoSyncTimer = setInterval(async () => {
+    try {
+      await loadDashboard();
+      if (state.page === "settings") renderSettings().catch(() => {});
+      if (state.page === "overview") loadOverview(true).catch(() => {});
+    } catch (e) { /* 静默: 下一轮再试, 避免托盘态刷屏报错 */ }
   }, sec);
 }
 

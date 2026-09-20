@@ -277,6 +277,11 @@ html[data-theme="dark"] .skeleton::after { background: linear-gradient(90deg, tr
 .model-cell { display: flex; align-items: center; gap: 7px; font-weight: 500; }
 .plan-badge { font-size: 10.5px; padding: 2px 8px; border-radius: 99px; font-weight: 700; background: var(--primary-soft); color: var(--primary); letter-spacing: 0.5px; }
 .plan-badge.lite { background: #e6f7f5; color: #0d9488; }
+/* 会话有效期徽章 (登录剩余天数): 由后台保活探测 better-auth 会话得到 */
+.sess { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 600; background: var(--muted); color: var(--text3); white-space: nowrap; }
+.sess.ok { background: #e8f7ef; color: #16a34a; }
+.sess.warn { background: #fef3c7; color: #b45309; }
+.sess.danger { background: var(--danger-soft); color: var(--red); }
 .pager { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 12px 0 8px; }
 .pager-info { font-size: 12px; color: var(--text3); font-variant-numeric: tabular-nums; }
 
@@ -406,5 +411,5 @@ html[data-theme="dark"] .skeleton::after { background: linear-gradient(90deg, tr
 .ur-name { font-size: 13px; font-weight: 600; display: flex; align-items: center; line-height: 1.35; }
 .ur-badge { margin-left: 8px; padding: 1px 8px; font-size: 10.5px; }
 .ur-ws { font-size: 11.5px; color: var(--text3); margin-top: 0; word-break: break-all; line-height: 1.35; }
-.ur-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.ur-actions { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
 #rename-input { width: 100%; margin-top: 4px; }
