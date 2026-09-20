@@ -29,8 +29,8 @@ from .commandcode_api import (
 )
 from .updater import RELEASE_PAGE_URL, check_update
 
-INCREMENTAL_LIMIT = 100  # 单次增量同步上限 (服务端窗口本来就是 1 天/100 条)
-FULL_MAX_PAGES = 20  # 全量同步翻页上限, 防失控
+INCREMENTAL_LIMIT = 100  # 单页条数 (服务端窗口本来就是 1 天/100 条)
+FULL_MAX_PAGES = 20  # 翻页上限, 增量与全量共用, 防失控
 QUOTA_CACHE_TTL = 30.0
 
 
@@ -386,9 +386,11 @@ def _sync_one_account(
         }
 
     try:
-        max_pages = FULL_MAX_PAGES if mode == "full" else 2
+        # 上游不支持翻页 (见 fetch_usage_all 的说明: 响应里 nextCursor 恒为 None),
+        # 所以这里实际永远只跑 1 页; max_pages 仅作防失控兜底, 增量/全量共用同一上限。
+        # 别再把增量改成"抓更多页"来试图补缺口 —— 上游根本不给你第 2 页。
         records, pages = fetch_usage_all(
-            cred, max_pages=max_pages, org_id=org_id or None
+            cred, max_pages=FULL_MAX_PAGES, org_id=org_id or None
         )
         inserted = db.insert_usage_records([r.to_db_dict() for r in records], account_id)
         buckets_added = _sync_buckets(cred, org_id, account_id)

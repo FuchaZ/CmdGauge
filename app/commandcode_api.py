@@ -454,8 +454,15 @@ def fetch_usage_all(
 ) -> tuple[list[UsageRecord], int]:
     """翻页拉取全部可用明细, 返回 (records, pages_fetched).
 
-    服务端窗口为"最近 1 天 / 最多 100 条", 因此正常情况下 1~2 页即到底;
-    max_pages 仅作防失控兜底.
+    **上游实际不支持翻页 (2026-09-20 实测)**: ``/internal/usage`` 的响应是
+    ``{usages: [...最多 100 条], nextCursor: None, window: {days: 1, entries: 100}}``
+    —— 显式传 ``cursor='0'`` 或 ``limit=1000`` 依旧只回最新 100 条且不带游标。
+    所以下面的循环**实际永远只跑 1 页**; 保留它是为了将来上游真给出游标时能自动
+    受益, ``max_pages`` 仍作为防失控兜底。
+
+    ⚠️ 由此推出的硬边界: **两次同步之间新增超过 100 条, 中间部分就永久丢失**
+    (窗口只有最近 1 天, 漏掉的过一天再也取不回来)。因此"进程长时间不运行"是
+    本地记录缺口的唯一来源 —— 详见 DESIGN.md「10. 100 条硬上限与同步缺口」。
     """
     records: list[UsageRecord] = []
     cursor: Optional[str] = None
