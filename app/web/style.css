@@ -99,6 +99,19 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--text);
 /* 首页: 内容可超出窗口高度, 允许滚动, 底部内容不再被裁
    (原先 overflow:hidden + 固定高度, 矮屏/DPI 缩放下今日趋势图被截断且无法滚到) */
 #page-home { overflow-y: auto; overflow-y: overlay; }
+/* 首页纵向 flex: 「今日趋势」卡吃掉剩余高度, 图表随窗口自适应 —— 矮窗口/高 DPI
+   缩放下不用滚动就能看全趋势图 (上方几块固定高度, 总高仍超出时由上面的
+   overflow-y 兜底滚动)。图表高度靠 .chart-box 传递, 由 app.js 的
+   fitChartCanvas 显式交给 Chart.js (responsive:false 不会自己跟随)。 */
+#page-home { display: flex; flex-direction: column; }
+#page-home > .ph,
+#page-home > .usage-blocks,
+#page-home > .card.overview { flex: 0 0 auto; }
+#page-home > .card.today-trend {
+  flex: 1 1 auto; min-height: 200px; margin-bottom: 0;
+  display: flex; flex-direction: column;
+}
+#page-home > .card.today-trend .chart-box { flex: 1 1 auto; min-height: 150px; }
 /* overlay 滚动条: 悬浮不占布局宽度, 保证左右空白对称 */
 #page-stats, #page-settings { overflow-y: auto; overflow-y: overlay; }
 
@@ -413,3 +426,30 @@ html[data-theme="dark"] .skeleton::after { background: linear-gradient(90deg, tr
 .ur-ws { font-size: 11.5px; color: var(--text3); margin-top: 0; word-break: break-all; line-height: 1.35; }
 .ur-actions { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
 #rename-input { width: 100%; margin-top: 4px; }
+
+/* 边缘抓取层 (app.js buildResizeGrips): 8px 热区, 显式 cursor 才改得动指针。
+   拖动中鼠标会滑出抓取层, body.resizing 让所有子元素继承 body 的光标
+   (命中元素链上 body/.main 都有显式 `default`, 不 inherit 就盖住 body 的 inline)。 */
+#resize-grips { position: fixed; inset: 0; pointer-events: none; z-index: 99999; }
+body.resizing * { cursor: inherit !important; }
+
+/* ---------- 矮窗口 / 高 DPI 缩放: 压缩首页上方卡片 ----------
+   本机实测 1012×641 CSS 视口下首页高 759px、可用仅 563px (要滚 196px);
+   这里把外框内边距/字号收紧后配合上面的「趋势卡吃剩余高度」正好一屏放下。 */
+@media (max-height: 820px) {
+  .main { padding: 10px 14px 10px; }
+  #page-home > .card.today-trend { min-height: 170px; }
+  #page-home > .card.today-trend .chart-box { min-height: 120px; }
+  .ph { margin-bottom: 9px; }
+  .ph-title { font-size: 16px; }
+  .usage-blocks { gap: 10px; margin-bottom: 10px; }
+  .ub { padding: 11px 14px 10px; }
+  .ub-head { margin-bottom: 7px; }
+  .ub-meta { margin-top: 6px; }
+  .overview { margin-bottom: 10px; padding-bottom: 8px; }
+  .card-h { padding: 10px 14px 0; }
+  .ov-grid { gap: 8px; padding: 8px 12px 4px; }
+  .kpi { padding: 9px 14px; }
+  .kpi-v { font-size: 20px; }
+  .kpi-s { margin-top: 1px; }
+}

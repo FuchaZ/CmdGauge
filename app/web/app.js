@@ -11,6 +11,7 @@ const I18N = {
     homeTitle: "用量统计总览", today: "今天", d7: "近7天", d30: "近30天", all: "全部",
     overviewTitle: "用量概览", followRange: "数据跟随时间范围",
     todayTrend: "今日趋势", hours24: "24 小时",
+    minimize: "最小化", maximize: "最大化", restore: "还原", closeWin: "关闭",
     statsTitle: "用量统计", tokenBreakdown: "Token 与成本构成",
     modelUsage: "模型用量", input: "输入", output: "输出", cost: "成本",
     usageTrend: "用量趋势", usageRecords: "使用记录", allModels: "全部模型",
@@ -117,6 +118,7 @@ const I18N = {
     homeTitle: "Usage Overview", today: "Today", d7: "7 Days", d30: "30 Days", all: "All",
     overviewTitle: "Usage Overview", followRange: "Follows selected range",
     todayTrend: "Today's Trend", hours24: "24 Hours",
+    minimize: "Minimize", maximize: "Maximize", restore: "Restore", closeWin: "Close",
     statsTitle: "Usage Stats", tokenBreakdown: "Tokens & Cost",
     modelUsage: "Model Usage", input: "Input", output: "Output", cost: "Cost",
     usageTrend: "Usage Trend", usageRecords: "Usage Records", allModels: "All Models",
@@ -345,6 +347,7 @@ function applyLang(l) {
   document.querySelectorAll("[data-i18n-title]").forEach((el) => {
     el.title = t(el.dataset.i18nTitle);
   });
+  applyMaximized(maximized);  // 最大化按钮的 title 是动态的, 语言切换后重刷
   document.querySelectorAll("#set-lang-pills .pill").forEach((b) => b.classList.toggle("active", b.dataset.v === lang));
   // 版本号唯一来源为后端 /api/version (app/__init__.py)
   const ver = APP_VERSION ? "v" + APP_VERSION : "CmdGauge";
@@ -397,10 +400,40 @@ async function pywebviewApi() {
   try { if (window.pywebview && window.pywebview.api) return window.pywebview.api; } catch (e) { /* ignore */ }
   return null;
 }
+/* ---------------- 最大化 / 还原 ----------------
+   标题栏按钮 + 双击标题栏两种入口。窗口是 frameless, 没有系统边框/最大化按钮,
+   后端按当前显示器的工作区自己算矩形 (用 Win32 SW_MAXIMIZE 会盖住任务栏),
+   状态也由后端推回来 —— 拖标题栏取消最大化时前端图标要跟着换。 */
+const TB_MAX_ICON = '<svg viewBox="0 0 12 12"><rect x="2.5" y="2.5" width="7" height="7" rx="1.3"/></svg>';
+const TB_RESTORE_ICON = '<svg viewBox="0 0 12 12"><rect x="2" y="4.4" width="5.6" height="5.6" rx="1.2"/><path d="M4.3 4.4V3.5A1.3 1.3 0 0 1 5.6 2.2h2.9A1.3 1.3 0 0 1 9.8 3.5v2.9a1.3 1.3 0 0 1-1.3 1.3h-.9"/></svg>';
+let maximized = false;  // 切语言时要按当前状态重刷按钮 title
+function applyMaximized(max) {
+  const btn = $("tb-max");
+  if (!btn) return;
+  maximized = !!max;
+  btn.innerHTML = max ? TB_RESTORE_ICON : TB_MAX_ICON;
+  btn.title = max ? t("restore") : t("maximize");
+}
+async function toggleMaximize() {
+  const a = await pywebviewApi();
+  if (!a || !a.toggle_maximize) return;
+  try {
+    const r = await a.toggle_maximize();
+    applyMaximized(!!(r && r.maximized));
+  } catch (e) { /* 窗口可能正在关闭 */ }
+}
+window.cmdgaugeOnMaximizeChange = (max) => applyMaximized(!!max);
+
 function bindTitlebar() {
   $("tb-min").addEventListener("click", async () => { const a = await pywebviewApi(); if (a) a.minimize(); });
+  $("tb-max").addEventListener("click", () => { toggleMaximize(); });
   $("tb-close").addEventListener("click", async () => { const a = await pywebviewApi(); if (a) a.close(); });
   $("tb-theme").addEventListener("click", () => applyDarkMode(document.documentElement.dataset.theme !== "dark"));
+  // 双击标题栏切换最大化 (Windows 习惯); 按钮/用户菜单上的双击照旧
+  document.querySelector(".tb").addEventListener("dblclick", (e) => {
+    if (e.target.closest("button, a, #user-menu, .user-switch")) return;
+    toggleMaximize();
+  });
 
   /* 标题栏拖动 (自实现, 替代 pywebview easy_drag):
      Chromium/WebView2 的 e.screenX/screenY 是 DIP(逻辑像素), 而后端 move_by 用
@@ -445,11 +478,17 @@ function bindTitlebar() {
 
 /* ---------------- 窗口边缘调整大小 ----------------
    frameless 窗口在 Windows 上失去系统边框, 系统不再提供边缘拖拽, 因此在前端
-   捕获窗口边缘的拖拽并在后端用 SetWindowPos 实现 (与标题栏拖动 move_by 同源):
-   mousedown 用捕获阶段先于标题栏拖动逻辑触发, 命中边缘时 stopPropagation 阻止
-   窗口拖动; mousemove 累积增量 (DIP × devicePixelRatio → 物理像素, 同 move_by),
-   rAF 合并后调用 resize_by。 */
-const RESIZE_EDGE_PX = 6;
+   捕获窗口边缘的拖拽并在后端用 SetWindowPos 实现 (与标题栏拖动 move_by 同源)。
+
+   **热区必须是「显式声明 cursor 的覆盖层」, 不能靠 html 上的 cursor 继承**:
+   实测本页面命中元素链上 body / .main 的 computed cursor 是 `default` (显式值),
+   而显式声明优先于继承 —— 在 html 上设 ew-resize 会被它们整个盖掉, 指针永远是
+   箭头 (用户"放在边缘没有可拖动箭头")。而自带 cursor 的 grip 元素一定能改变
+   指针 (实测 hCursor 从 65539 箭头 → 65553 双向箭头)。
+   另: 6px 热区在高 DPI 屏上极难命中, 实测 8px (125% 缩放约 10 物理像素) 才顺手。
+   抓取层只在最外 8px, 不挡滚动条/按钮 (页面内容距窗口边缘 ≥14px)。 */
+const RESIZE_EDGE_PX = 8;
+const RESIZE_CORNER_PX = 14;
 const EDGE_CURSOR = {
   n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize",
   ne: "nesw-resize", sw: "nesw-resize", nw: "nwse-resize", se: "nwse-resize",
@@ -460,14 +499,37 @@ let resizePending = { x: 0, y: 0 };  // 物理像素 (含小数余量)
 let resizeDpr = 1;
 let resizeRaf = null;
 
-function edgeAt(x, y) {
-  const w = window.innerWidth, h = window.innerHeight;
-  let e = "";
-  if (y <= RESIZE_EDGE_PX) e += "n";
-  else if (y >= h - RESIZE_EDGE_PX) e += "s";
-  if (x <= RESIZE_EDGE_PX) e += "w";
-  else if (x >= w - RESIZE_EDGE_PX) e += "e";
-  return e;
+/* 八向抓取层: 每块自带 cursor, 悬停即变形; mousedown 委托到层容器 */
+function buildResizeGrips() {
+  const E = RESIZE_EDGE_PX, C = RESIZE_CORNER_PX;
+  const specs = [
+    ["n", `top:0;left:${C}px;right:${C}px;height:${E}px`],
+    ["s", `bottom:0;left:${C}px;right:${C}px;height:${E}px`],
+    ["w", `top:${C}px;bottom:${C}px;left:0;width:${E}px`],
+    ["e", `top:${C}px;bottom:${C}px;right:0;width:${E}px`],
+    ["nw", `top:0;left:0;width:${C}px;height:${C}px`],
+    ["ne", `top:0;right:0;width:${C}px;height:${C}px`],
+    ["sw", `bottom:0;left:0;width:${C}px;height:${C}px`],
+    ["se", `bottom:0;right:0;width:${C}px;height:${C}px`],
+  ];
+  const layer = document.createElement("div");
+  layer.id = "resize-grips";
+  layer.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:99999";
+  for (const [edge, pos] of specs) {
+    const g = document.createElement("div");
+    g.dataset.edge = edge;
+    g.style.cssText = `position:absolute;pointer-events:auto;cursor:${EDGE_CURSOR[edge]};${pos}`;
+    layer.appendChild(g);
+  }
+  document.body.appendChild(layer);
+  return layer;
+}
+
+/* 拖动过程中鼠标会滑出抓取层, 用 body 兜住: body 的 inline cursor 覆盖它自己的
+   default 声明, 再加 .resizing 让子元素 (computed 为 default 的 .main 等) 一起继承 */
+function setResizeCursor(edge) {
+  document.body.style.cursor = EDGE_CURSOR[edge] || "";
+  document.body.classList.toggle("resizing", !!edge);
 }
 function flushResize() {
   resizeRaf = null;
@@ -480,35 +542,33 @@ function flushResize() {
 }
 function cancelResize() {
   if (!resizeEdge) return;
-  resizeEdge = "";
   if (resizeRaf) { cancelAnimationFrame(resizeRaf); resizeRaf = null; }
-  flushResize();
+  flushResize();  // 先把待发增量发出去 (清空 resizeEdge 后就发不了了)
+  resizeEdge = "";
+  setResizeCursor("");
 }
 function bindWindowResize() {
+  const layer = buildResizeGrips();
+  layer.addEventListener("mousedown", (e) => {
+    const edge = (e.target && e.target.dataset && e.target.dataset.edge) || "";
+    if (!edge || e.button !== 0) return;
+    resizeEdge = edge;
+    resizeDpr = window.devicePixelRatio || 1;
+    resizeLast = { lx: e.screenX, ly: e.screenY };
+    resizePending = { x: 0, y: 0 };
+    setResizeCursor(edge);
+    e.preventDefault();
+    e.stopPropagation();  // 阻止标题栏拖动
+  });
   window.addEventListener("mousemove", (e) => {
-    if (!resizeEdge) {
-      document.documentElement.style.cursor = EDGE_CURSOR[edgeAt(e.clientX, e.clientY)] || "";
-      return;
-    }
+    if (!resizeEdge) return;
     if (!(e.buttons & 1)) { cancelResize(); return; }  // mouseup 丢失兜底
-    document.documentElement.style.cursor = EDGE_CURSOR[resizeEdge] || "";
     resizePending.x += (e.screenX - resizeLast.lx) * resizeDpr;
     resizePending.y += (e.screenY - resizeLast.ly) * resizeDpr;
     resizeLast.lx = e.screenX;
     resizeLast.ly = e.screenY;
     if (!resizeRaf) resizeRaf = requestAnimationFrame(flushResize);
   });
-  window.addEventListener("mousedown", (e) => {
-    if (e.button !== 0) return;
-    const edge = edgeAt(e.clientX, e.clientY);
-    if (!edge) return;
-    resizeEdge = edge;
-    resizeDpr = window.devicePixelRatio || 1;
-    resizeLast = { lx: e.screenX, ly: e.screenY };
-    resizePending = { x: 0, y: 0 };
-    e.preventDefault();
-    e.stopPropagation();  // 阻止标题栏拖动
-  }, true);  // 捕获阶段: 先于 .tb 的 mousedown
   window.addEventListener("mouseup", cancelResize);
   window.addEventListener("blur", cancelResize);
 }
@@ -683,7 +743,7 @@ function chartToday(trend) {
       },
     },
   });
-  cToday.resize();
+  fitChartCanvas(canvas, cToday);
 }
 
 /* ---------------- 统计页: 4 总卡 + 6 明细 ---------------- */
@@ -759,7 +819,7 @@ function chartModel(models) {
       },
     },
   });
-  cModel.resize();
+  fitChartCanvas(canvas, cModel);
   $("mr-list").innerHTML = sorted.slice(0, 3).map((m, i) => `
     <div class="mr-item"><span class="mr-rank">#${i + 1}</span>
     <span class="mr-name">${modelIcon(m.model)}<span class="txt">${escapeHtml(m.model)}</span></span>
@@ -805,7 +865,7 @@ function chartTrend(trend) {
       },
     },
   });
-  cTrend.resize();
+  fitChartCanvas(canvas, cTrend);
 }
 
 /* ---------------- 每日用量 ---------------- */
@@ -1196,7 +1256,7 @@ function chartOvTrend(accounts) {
       },
     },
   });
-  cOvTrendChart.resize();
+  fitChartCanvas(canvas, cOvTrendChart);
 }
 
 /* ---------------- 设置页 ---------------- */
@@ -1678,12 +1738,26 @@ function rerenderCharts() {
   }
 }
 
-/* 窗口尺寸变化: 长防抖 (250ms) 后执行一次轻量 chart.resize()
-   (只处理可见页图表 — hidden 页面容器尺寸为 0, resize() 会死循环卡死) */
+/* 按 .chart-box 的内容区显式设定图表尺寸。
+   Chart.js 全是 responsive:false (WebView2 里 responsive:true 碰到隐藏页
+   容器尺寸为 0 会死循环), 于是 canvas 尺寸**不会**自己跟随容器变化 —— 窗口
+   缩放后必须显式 resize(w,h)。矮窗口下今日趋势图因此能跟着 CSS 变矮, 而不是
+   用固定高度把首页撑出滚动条。
+   隐藏页 (clientWidth/Height 为 0) 直接跳过: 给 0 尺寸会触发 Chart.js 死循环。 */
+function fitChartCanvas(canvas, chart) {
+  if (!canvas || !chart) return;
+  const box = canvas.parentElement;
+  if (!box) return;
+  const cs = getComputedStyle(box);
+  const w = Math.floor(box.clientWidth - parseFloat(cs.paddingLeft || 0) - parseFloat(cs.paddingRight || 0));
+  const h = Math.floor(box.clientHeight - parseFloat(cs.paddingTop || 0) - parseFloat(cs.paddingBottom || 0));
+  if (w <= 0 || h <= 0) return;
+  chart.resize(w, h);
+}
+/* 窗口尺寸变化: 长防抖 (250ms) 后给可见页的图表量一次尺寸 */
 function safeResize(chart) {
   if (!chart || !chart.canvas) return;
-  const box = chart.canvas.parentElement;
-  if (box && box.clientWidth > 0 && box.clientHeight > 0) chart.resize();
+  fitChartCanvas(chart.canvas, chart);
 }
 let resizeTimer = null;
 window.addEventListener("resize", () => {

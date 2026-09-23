@@ -349,6 +349,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 # 后写者会用旧快照覆盖前者 (丢 window_days/active_account_id 等), 必须串行化
 _settings_lock = threading.Lock()
 
+# 主窗口几何存这里: 属于窗口布局状态, 不进 _DEFAULT_SETTINGS
+# (否则会混进 /api/settings 的对外契约, 前端每次 PUT 都得原样带回来)
+_WINDOW_GEOMETRY_KEY = "window_geometry"
+
 
 def _raw_payload(conn: sqlite3.Connection) -> dict[str, Any]:
     row = conn.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
@@ -911,6 +915,25 @@ def save_settings(payload: dict[str, Any]) -> dict[str, Any]:
         _write_payload(conn, out)
         conn.commit()
     return current
+
+
+def get_window_geometry() -> Optional[dict[str, Any]]:
+    """主窗口上次的位置与尺寸 (物理像素, 含保存时的 DPI 缩放); 无记录返回 None."""
+    geo = _raw_payload(get_db()).get(_WINDOW_GEOMETRY_KEY)
+    return geo if isinstance(geo, dict) else None
+
+
+def save_window_geometry(geometry: Optional[dict[str, Any]]) -> None:
+    """保存主窗口几何 (``None`` = 清除记录)."""
+    conn = get_db()
+    with _settings_lock:  # payload 整包读-改-写: 必须与 save_settings 串行
+        raw = _raw_payload(conn)
+        if geometry is None:
+            raw.pop(_WINDOW_GEOMETRY_KEY, None)
+        else:
+            raw[_WINDOW_GEOMETRY_KEY] = geometry
+        _write_payload(conn, raw)
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------

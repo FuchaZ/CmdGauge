@@ -33,6 +33,26 @@ class _RECT(ctypes.Structure):
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.wintypes.DWORD), ("rcMonitor", _RECT),
+                ("rcWork", _RECT), ("dwFlags", ctypes.wintypes.DWORD)]
+
+
+def _ensure_dpi_awareness() -> None:
+    """在创建窗口前声明 DPI 感知, 与 pywebview 保持同一坐标系.
+
+    pywebview 的 WinForms 后端会在 ``webview.start()`` 里调 ``SetProcessDPIAware()``。
+    但我们在那之前就要读工作区与保存的窗口几何 —— 未声明感知级别的进程拿到的是
+    **虚拟化坐标**(本机实测: 2560x1380 的工作区被读成 2048x1104, 差 1.25 倍),
+    与保存的物理像素几何不同源, 恢复出来的尺寸会莫名缩小。这里先声明一次(幂等,
+    pywebview 之后再调用不会改变级别)。
+    """
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception as exc:  # noqa: BLE001
+        _mlog(f"[dpi] SetProcessDPIAware 失败: {exc}")
+
+
 def _screen_workarea_logical() -> tuple[int, int]:
     """主屏工作区尺寸(逻辑像素): 窗口初始尺寸不超工作区, 避免矮屏上底部被裁."""
     try:
@@ -44,6 +64,199 @@ def _screen_workarea_logical() -> tuple[int, int]:
     except Exception:  # noqa: BLE001
         pass
     return WINDOW_SIZE
+
+
+# ---------------------------------------------------------------------------
+# 窗口几何: DPI 缩放换算 / 工作区 / 上次位置尺寸的恢复
+# ---------------------------------------------------------------------------
+
+_GEOMETRY_SAVE_DELAY = 1.2  # 拖动/缩放停止多久后落库 (不能每帧写 SQLite)
+_geom_timer: threading.Timer | None = None
+_geom_lock = threading.Lock()
+
+
+def _window_scale(hwnd: int = 0) -> float:
+    """窗口所在显示器的 DPI 缩放 (逻辑像素 → 物理像素), 失败回退 1.0.
+
+    与 pywebview ``BrowserView._scale`` 同源 (``GetDpiForWindow(hwnd)/96``):
+    ``create_window`` 的 width/height/x/y 收的是**逻辑像素**, pywebview 会乘这个
+    比例再交给 WinForms。注意 ``GetDpiForSystem`` 在 system-DPI-aware 进程里给出
+    的是系统 DPI, 本机实测 system=96 而窗口所在屏=120 (两个值可以不同), 所以
+    拿得到 hwnd 时优先用它。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        dpi = user32.GetDpiForWindow(hwnd) if hwnd else user32.GetDpiForSystem()
+        return (int(dpi) or 96) / 96.0
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def _physical_min_size(hwnd: int = 0) -> tuple[int, int]:
+    """``WINDOW_MIN_SIZE`` (逻辑像素) 换算成当前显示器物理像素.
+
+    前端拖边缘时发来的是物理像素增量, 与 ``GetWindowRect`` 同一坐标系,
+    所以下限也必须换算成物理像素再比较。
+    """
+    scale = _window_scale(hwnd)
+    return int(WINDOW_MIN_SIZE[0] * scale), int(WINDOW_MIN_SIZE[1] * scale)
+
+
+def _monitor_work_area(hwnd: int) -> tuple[int, int, int, int] | None:
+    """窗口所在显示器的物理工作区 (left, top, right, bottom)."""
+    try:
+        hmon = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        if not hmon:
+            return None
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            return None
+        r = info.rcWork
+        return r.left, r.top, r.right, r.bottom
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _work_areas() -> list[tuple[int, int, int, int]]:
+    """所有显示器的物理工作区列表 (恢复窗口位置时用于判断还在不在屏幕上)."""
+    areas: list[tuple[int, int, int, int]] = []
+
+    @ctypes.WINFUNCTYPE(
+        ctypes.wintypes.BOOL, ctypes.wintypes.HMONITOR, ctypes.wintypes.HDC,
+        ctypes.POINTER(_RECT), ctypes.wintypes.LPARAM,
+    )
+    def _on_monitor(hmon, _hdc, _rect, _lparam):
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            r = info.rcWork
+            areas.append((r.left, r.top, r.right, r.bottom))
+        return True
+
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, _on_monitor, 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return areas
+
+
+def _clamp_window_geometry(
+    geo: dict, work_areas: list[tuple[int, int, int, int]], min_size: tuple[int, int]
+) -> tuple[int, int, int, int] | None:
+    """把保存的窗口几何夹进可用工作区 (纯函数, 便于单测).
+
+    Args:
+        geo: {"left","top","width","height"} 物理像素
+        work_areas: 各显示器工作区 (物理像素)
+        min_size: 最小尺寸 (物理像素)
+    Returns:
+        (left, top, width, height); 保存的位置已经完全不在任何显示器上时返回
+        None (调用方回退到默认居中)
+    """
+    try:
+        left = int(geo["left"])
+        top = int(geo["top"])
+        width = int(geo["width"])
+        height = int(geo["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0 or not work_areas:
+        return None
+    min_w, min_h = min_size
+    # 取重叠面积最大的显示器; 与所有显示器都不重叠 (拔掉外接屏/改分辨率) 就放弃
+    best: tuple[int, int, int, int, int] | None = None
+    for wl, wt, wr, wb in work_areas:
+        ox = min(wr, left + width) - max(wl, left)
+        oy = min(wb, top + height) - max(wt, top)
+        if ox <= 0 or oy <= 0:
+            continue
+        if best is None or ox * oy > best[0]:
+            best = (ox * oy, wl, wt, wr, wb)
+    if best is None:
+        return None
+    _, wl, wt, wr, wb = best
+    width = max(min_w, min(width, wr - wl))
+    height = max(min_h, min(height, wb - wt))
+    left = min(max(left, wl), max(wl, wr - width))
+    top = min(max(top, wt), max(wt, wb - height))
+    return left, top, width, height
+
+
+def _default_window_rect() -> tuple[int, int, int, int] | None:
+    """默认窗口矩形 (物理像素): 设计尺寸按当前缩放放大, 居中于主显示器工作区.
+
+    不能只把 width/height 交给 pywebview —— 它在 frameless 窗口上先把带边框 Form 的
+    ``Size`` 设成 ``请求 × 缩放``、随后才切 ``FormBorderStyle.None``, WinForms 保留的是
+    **客户区**, 于是实际外框会比请求小一圈 (本机实测差 18 x 47 物理像素, 125% 缩放)。
+    这里算出目标矩形, 窗口显示后再用 SetWindowPos 落到位。
+    """
+    scale = _window_scale() or 1.0
+    min_w, min_h = _physical_min_size()
+    width = max(int(WINDOW_SIZE[0] * scale), min_w)
+    height = max(int(WINDOW_SIZE[1] * scale), min_h)
+    areas = _work_areas()
+    if not areas:
+        return None
+    wl, wt, wr, wb = areas[0]
+    width = min(width, wr - wl)
+    height = min(height, wb - wt)
+    left = wl + max(0, (wr - wl - width) // 2)
+    top = wt + max(0, (wb - wt - height) // 2)
+    return left, top, width, height
+
+
+def _restored_window_rect() -> tuple[tuple[int, int, int, int], float] | None:
+    """上次保存的窗口几何: (物理矩形, 保存时的缩放); 无记录/已不可用返回 None."""
+    try:
+        geo = db.get_window_geometry()
+    except Exception as exc:  # noqa: BLE001 几何读不出来不该拦住启动
+        _mlog(f"[geometry] load failed: {exc}")
+        return None
+    if not isinstance(geo, dict):
+        return None
+    clamped = _clamp_window_geometry(geo, _work_areas(), _physical_min_size())
+    if clamped is None:
+        _mlog("[geometry] 保存的位置已不在任何显示器上, 回退默认居中")
+        return None
+    try:
+        saved_scale = float(geo.get("scale") or 0) or _window_scale()
+    except (TypeError, ValueError):
+        saved_scale = _window_scale()
+    return clamped, saved_scale
+
+
+def _startup_window_geometry() -> tuple[tuple[int, int, int, int] | None, float]:
+    """启动目标: (窗口物理矩形, 折算逻辑像素用的缩放).
+
+    矩形为 None 表示拿不到显示器工作区 (极端情况) —— 调用方回退纯逻辑尺寸。
+    折算用**保存时**的缩放: 换了不同 DPI 的显示器后界面尺寸 (CSS 像素) 仍与上次一致。
+    """
+    restored = _restored_window_rect()
+    if restored:
+        return restored
+    return _default_window_rect(), _window_scale() or 1.0
+
+
+def _initial_window_geometry() -> tuple[int, int, int | None, int | None]:
+    """``create_window`` 的 (width, height, x, y) —— 逻辑像素 (诊断/单测用).
+
+    真实定位由 ``_startup_window_geometry`` 的物理矩形在窗口显示后 SetWindowPos 落到,
+    这里只是让首帧别太离谱。
+    """
+    rect, scale = _startup_window_geometry()
+    if rect is None:
+        wa_w, wa_h = _screen_workarea_logical()
+        return min(WINDOW_SIZE[0], wa_w - 60), min(WINDOW_SIZE[1], wa_h - 60), None, None
+    left, top, width, height = rect
+    scale = scale or 1.0
+    return (
+        max(1, round(width / scale)),
+        max(1, round(height / scale)),
+        round(left / scale),
+        round(top / scale),
+    )
+
 
 _quitting = False  # 托盘"退出"标志: 为 True 时关闭窗口=真正退出
 _tray_ready = False  # 托盘是否成功启动 (失败时关闭窗口=直接退出, 避免无法关闭)
@@ -231,9 +444,14 @@ class TrayIcon:
         self._icon_path = icon_path
         self._icon = None
         self._win_getter = None
+        self._before_quit = None
 
     def bind_window(self, getter) -> None:
         self._win_getter = getter
+
+    def set_before_quit(self, cb) -> None:
+        """退出前回调 (用于把窗口几何落库)."""
+        self._before_quit = cb
 
     def start(self) -> bool:
         global _tray_ready
@@ -295,6 +513,11 @@ class TrayIcon:
 
     def _quit(self, icon=None, item=None) -> None:
         global _quitting
+        if self._before_quit:
+            try:
+                self._before_quit()  # 托盘退出前把窗口几何落库
+            except Exception:  # noqa: BLE001
+                pass
         _quitting = True
         if icon:
             try:
@@ -305,7 +528,8 @@ class TrayIcon:
 
 
 def _compute_resized_rect(
-    left: int, top: int, right: int, bottom: int, edge: str, dx: int, dy: int
+    left: int, top: int, right: int, bottom: int, edge: str, dx: int, dy: int,
+    min_size: tuple[int, int] = WINDOW_MIN_SIZE,
 ) -> tuple[int, int, int, int]:
     """按拖拽方向计算新的窗口矩形 (纯函数, 便于单测).
 
@@ -313,10 +537,11 @@ def _compute_resized_rect(
         left/top/right/bottom: 当前窗口矩形 (屏幕物理像素)
         edge: "n"/"s"/"e"/"w" 的组合, 如 "ne"
         dx/dy: 屏幕像素增量
+        min_size: 最小尺寸 (必须与 rect 同一坐标系 —— 调用方给物理像素)
     Returns:
-        (left, top, right, bottom); 受 WINDOW_MIN_SIZE 约束, 不会倒置或成负尺寸
+        (left, top, right, bottom); 不会倒置或成负尺寸
     """
-    min_w, min_h = WINDOW_MIN_SIZE
+    min_w, min_h = min_size
     edge = (edge or "").lower()
     if "e" in edge:
         right = max(left + min_w, right + int(dx))
@@ -335,6 +560,9 @@ class WindowApi:
     def __init__(self) -> None:
         self._win = None
         self._on_open_login = None
+        self._maximized = False
+        # 最大化前的窗口矩形 (物理像素): 还原用, 也是此刻该记入的"窗口尺寸"
+        self._restore_rect: tuple[int, int, int, int] | None = None
 
     def bind(self, win) -> None:
         self._win = win
@@ -366,8 +594,14 @@ class WindowApi:
         读到同一旧位置、各自 SetWindowPos, 增量被覆盖丢失。
         """
         try:
-            native = self._win.native
-            hwnd = int(native.Handle.ToInt32())
+            if not self._win:
+                return False
+            if self._maximized:
+                # 最大化状态下拖标题栏: 按 Windows 习惯先还原 (本次增量丢弃,
+                # 免得窗口从最大化位置突然跳一段)
+                self._unmaximize()
+                return True
+            hwnd = self._hwnd()
             with _move_lock:
                 rect = _RECT()
                 ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
@@ -375,6 +609,7 @@ class WindowApi:
                     hwnd, None, rect.left + int(dx), rect.top + int(dy),
                     0, 0, 0x0001 | 0x0004,  # SWP_NOSIZE | SWP_NOZORDER
                 )
+            self._schedule_geometry_save()
         except Exception:  # noqa: BLE001
             pass
         return True
@@ -386,33 +621,170 @@ class WindowApi:
         边框拖拽, 因此由前端在窗口边缘捕获拖拽后调用本方法。
         edge 为 "n"/"s"/"e"/"w" 或 "ne"/"nw"/"se"/"sw" 组合; dx/dy 是屏幕物理像素
         增量 (与 GetWindowRect 同坐标系), 与 move_by 保持一致; 最小尺寸受
-        WINDOW_MIN_SIZE 约束。
+        WINDOW_MIN_SIZE 约束 —— 该常量是**逻辑像素**, 这里换算成物理像素再比较
+        (否则 125% 缩放屏上能拖到比设计值更小)。
         """
         try:
             if not self._win:
                 return False
-            native = self._win.native
-            hwnd = int(native.Handle.ToInt32())
+            if self._maximized:
+                return True  # 最大化状态不可缩放 (与系统窗口一致), 先点还原
+            hwnd = self._hwnd()
             edge = (edge or "").lower()
+            min_size = _physical_min_size(hwnd)
             with _move_lock:
                 rect = _RECT()
                 ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
                 left, top, right, bottom = _compute_resized_rect(
-                    rect.left, rect.top, rect.right, rect.bottom, edge, dx, dy
+                    rect.left, rect.top, rect.right, rect.bottom, edge, dx, dy, min_size
                 )
                 ctypes.windll.user32.SetWindowPos(
                     hwnd, None, left, top, right - left, bottom - top,
                     0x0004,  # SWP_NOZORDER
                 )
+            self._schedule_geometry_save()
         except Exception:  # noqa: BLE001
             pass
         return True
+
+    # ------------------------------------------------------------------
+    # 最大化 / 还原 + 窗口几何持久化
+    # ------------------------------------------------------------------
+
+    def _hwnd(self) -> int:
+        return int(self._win.native.Handle.ToInt32())
+
+    def _get_rect(self) -> tuple[int, int, int, int] | None:
+        try:
+            rect = _RECT()
+            ctypes.windll.user32.GetWindowRect(self._hwnd(), ctypes.byref(rect))
+            return rect.left, rect.top, rect.right, rect.bottom
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _set_rect(self, left: int, top: int, right: int, bottom: int) -> None:
+        with _move_lock:
+            ctypes.windll.user32.SetWindowPos(
+                self._hwnd(), None, int(left), int(top),
+                int(right - left), int(bottom - top),
+                0x0004 | 0x0010,  # SWP_NOZORDER | SWP_NOACTIVATE
+            )
+
+    def _notify_max_state(self) -> None:
+        """把最大化状态推给前端 (标题栏按钮图标要跟着换)."""
+        flag = "true" if self._maximized else "false"
+        try:
+            self._win.evaluate_js(
+                "window.cmdgaugeOnMaximizeChange"
+                f" && window.cmdgaugeOnMaximizeChange({flag});"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _unmaximize(self) -> bool:
+        """最大化 → 还原到记录下来的矩形."""
+        if not self._maximized:
+            return False
+        rect = self._restore_rect
+        self._maximized = False
+        self._restore_rect = None
+        if rect is not None:
+            try:
+                self._set_rect(*rect)
+            except Exception:  # noqa: BLE001
+                pass
+        self._notify_max_state()
+        self._schedule_geometry_save()
+        return True
+
+    def toggle_maximize(self) -> dict:
+        """最大化到当前显示器工作区 / 还原, 返回 ``{"maximized": bool}``.
+
+        不用 Win32 的 ``SW_MAXIMIZE``: 本窗口是 frameless (没有 WS_CAPTION),
+        系统算 ptMaxSize 时会按**整块屏幕**给尺寸, 结果盖住任务栏。这里自己取
+        ``rcWork`` 再 SetWindowPos。
+        """
+        if not self._win:
+            return {"maximized": False}
+        try:
+            if self._maximized:
+                self._unmaximize()
+            else:
+                rect = self._get_rect()
+                area = _monitor_work_area(self._hwnd())
+                if rect is None or area is None:
+                    return {"maximized": self._maximized}
+                self._restore_rect = rect
+                self._set_rect(*area)
+                self._maximized = True
+                self._notify_max_state()
+                self._schedule_geometry_save()
+        except Exception as exc:  # noqa: BLE001
+            _mlog(f"[maximize] toggle failed: {exc}")
+        return {"maximized": self._maximized}
+
+    def apply_rect(self, left: int, top: int, width: int, height: int) -> bool:
+        """把窗口精确放到指定物理矩形.
+
+        启动时用它落位: pywebview 的 ``width/height`` 在 frameless 窗口上会少一圈
+        (先设带边框 Form 的 Size 再切 FormBorderStyle.None, 见 ``_default_window_rect``),
+        只靠 create_window 的尺寸会让保存/恢复的尺寸每次缩一点。
+        """
+        if not self._win:
+            return False
+        try:
+            self._set_rect(left, top, left + width, top + height)
+        except Exception as exc:  # noqa: BLE001
+            _mlog(f"[geometry] apply_rect failed: {exc}")
+            return False
+        return True
+
+    def save_geometry(self) -> None:
+        """立即落库当前窗口几何 (退出 / 隐藏到托盘前调用)."""
+        with _geom_lock:
+            timer = _geom_timer
+        if timer is not None:
+            timer.cancel()
+        self._save_geometry_now()
+
+    def _schedule_geometry_save(self, delay: float = _GEOMETRY_SAVE_DELAY) -> None:
+        """拖完/缩放完 delay 秒后落库一次 (拖动期间每帧写库没必要)."""
+        global _geom_timer
+        with _geom_lock:
+            if _geom_timer is not None:
+                _geom_timer.cancel()
+            _geom_timer = threading.Timer(delay, self._save_geometry_now)
+            _geom_timer.daemon = True
+            _geom_timer.start()
+
+    def _save_geometry_now(self) -> None:
+        """把当前窗口几何写进 settings (物理像素 + 当前 DPI 缩放)."""
+        try:
+            if not self._win:
+                return
+            # 最大化状态记的是「还原后」的尺寸: 下次启动不该顶着一整屏
+            rect = self._restore_rect if self._maximized else self._get_rect()
+            if not rect:
+                return
+            left, top, right, bottom = rect
+            width, height = right - left, bottom - top
+            if width <= 0 or height <= 0:
+                return
+            db.save_window_geometry({
+                "left": left, "top": top, "width": width, "height": height,
+                "scale": round(_window_scale(self._hwnd()), 4),
+            })
+        except Exception as exc:  # noqa: BLE001
+            _mlog(f"[geometry] save failed: {exc}")
+        finally:
+            db.close_thread_conn()  # 定时器线程的连接必须回收, 否则长驻进程按次泄漏
 
     def close(self) -> bool:
         """关闭按钮: 托盘可用时最小化到托盘, 否则真正关闭."""
         global _quitting, _tray_ready
         if not self._win:
             return True
+        self.save_geometry()  # 隐藏/退出前落库, 下次启动沿用同一位置尺寸
         if _quitting or not _tray_ready:
             _mlog(f"  [close] real quit (quitting={_quitting}, tray_ready={_tray_ready})")
             self._win.destroy()
@@ -424,6 +796,7 @@ class WindowApi:
     def quit(self) -> bool:
         """退出应用 (欢迎页/设置页按钮): 真正退出, 不驻留托盘."""
         global _quitting
+        self.save_geometry()
         _quitting = True
         _destroy_all_windows()
         return True
@@ -438,7 +811,7 @@ def _destroy_all_windows() -> None:
             pass
 
 
-def _install_close_to_tray(win) -> bool:
+def _install_close_to_tray(win, on_hide=None) -> bool:
     """在 WinForms 层订阅 `FormClosing`, 把「关闭」改写成「隐藏到托盘」.
 
     **不要用 pywebview 自带的 `closing` 事件**: `Event.set()` 把 handler 丢进
@@ -467,6 +840,11 @@ def _install_close_to_tray(win) -> bool:
                 _mlog(f"[close] FormClosing hide failed: {exc}")
                 return
             args.Cancel = True
+            if on_hide is not None:
+                try:
+                    on_hide()  # 隐藏前把窗口几何落库
+                except Exception as exc:  # noqa: BLE001
+                    _mlog(f"[close] on_hide callback failed: {exc}")
             _mlog("[close] native close intercepted -> hidden to tray")
 
         form.FormClosing += on_form_closing
@@ -477,7 +855,7 @@ def _install_close_to_tray(win) -> bool:
         return False
 
 
-def _install_close_to_tray_when_ready(win, timeout: float = 5.0) -> None:
+def _install_close_to_tray_when_ready(win, on_hide=None, timeout: float = 5.0) -> None:
     """等 ``win.native`` 就绪后再装拦截.
 
     `native` 由 pywebview 在 `webview.start()` 内部创建, 所以这个函数是交给
@@ -486,7 +864,7 @@ def _install_close_to_tray_when_ready(win, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if getattr(win, "native", None) is not None:
-            if _install_close_to_tray(win):
+            if _install_close_to_tray(win, on_hide):
                 return
         time.sleep(0.1)
     _mlog("[close] 超时: 未能安装 FormClosing 拦截 (关闭窗口仍会退出进程)")
@@ -494,6 +872,9 @@ def _install_close_to_tray_when_ready(win, timeout: float = 5.0) -> None:
 
 def main() -> None:
     global _quitting
+
+    # DPI 感知必须在任何坐标读取之前声明 (否则拿到虚拟化坐标, 见函数注释)
+    _ensure_dpi_awareness()
 
     # 单实例守卫: 已有实例在运行时激活其窗口, 当前进程直接退出
     _ensure_single_instance()
@@ -506,14 +887,16 @@ def main() -> None:
     api = WindowApi()
 
     # 启动窗口: 始终加载本地页面; 未登录时前端显示欢迎页引导登录
-    wa_w, wa_h = _screen_workarea_logical()
-    win_w = min(WINDOW_SIZE[0], wa_w - 60)
-    win_h = min(WINDOW_SIZE[1], wa_h - 60)
+    # 目标几何优先沿用上次关闭时的位置尺寸 (用户要求记住窗口大小)
+    target_rect, target_scale = _startup_window_geometry()
+    win_w, win_h, win_x, win_y = _initial_window_geometry()
     main_win = webview.create_window(
         APP_TITLE,
         dashboard_url,
         width=win_w,
         height=win_h,
+        x=win_x,
+        y=win_y,
         min_size=WINDOW_MIN_SIZE,
         frameless=True,  # 自定义标题栏
         # 显式关闭 easy_drag: 其默认值为 True, 不传会保持开启 (高 DPI 下拖动漂移)
@@ -682,6 +1065,10 @@ def main() -> None:
     def on_shown() -> None:
         # 窗口显示后 native 句柄才可用: 补 WS_MINIMIZEBOX, 修复任务栏点击不最小化
         _enable_taskbar_minimize(main_win)
+        # 再把目标矩形精确落位 (pywebview 的 width/height 在 frameless 窗口上会少一圈,
+        # 见 _default_window_rect); 目标为 None (拿不到工作区) 时保持 create_window 的结果
+        if target_rect:
+            api.apply_rect(*target_rect)
 
     def on_restored() -> None:
         # 窗口最小化->恢复过程中 WinForms 可能重建句柄导致样式丢失, 恢复后重新补上
@@ -694,6 +1081,7 @@ def main() -> None:
     # 系统托盘 (logo 图标)
     tray = TrayIcon(_asset_path(ICON_NAME))
     tray.bind_window(lambda: main_win if main_win in webview.windows else None)
+    tray.set_before_quit(api.save_geometry)  # 托盘「退出」前落库窗口几何
     tray.start()
 
     icon_path = _asset_path(ICON_NAME)
@@ -709,7 +1097,9 @@ def main() -> None:
         storage = ""
     # 「关闭→托盘」的拦截要等 WinForms 窗口真正建好 (win.native 才有值), 而那已经
     # 是 webview.start() 内部的事了 —— 所以借它的后台 func 钩子来装。
-    install_close_hook = lambda: _install_close_to_tray_when_ready(main_win)  # noqa: E731
+    install_close_hook = lambda: _install_close_to_tray_when_ready(  # noqa: E731
+        main_win, api.save_geometry
+    )
     if storage:
         webview.start(
             install_close_hook,

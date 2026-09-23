@@ -1,2 +1,2 @@
 """CmdGauge - Command Code 用量统计面板."""
-__version__ = "1.0.4"
+__version__ = "1.0.5"

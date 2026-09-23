@@ -272,3 +272,86 @@ UI 对月度卡标注「额度按套餐估算」）；两模式的 5h/weekly/mon
 - **唯一防线是进程常驻**：v1.0.3 的后台调度线程已保证「窗口隐藏到托盘也每 60 秒同步」，
   而 1 分钟远不可能产生 100 条 ⇒ **只要不彻底退出程序就不会新增缺口**
 - 想知道完整周期用量，看 `summary` 的账单周期口径，而不是本地聚合
+
+## 11. 窗口尺寸可调 / 最大化 / 几何记忆（v1.0.5）
+
+### 现象（用户报的）
+
+1. 「程序无法调节窗口大小，默认尺寸要上下滚动才能看全下方今日趋势」
+2. 补一条更关键的：**把鼠标移到窗口边缘，指针始终是箭头**，没有可拖动的双向箭头
+
+### 排查：功能其实通，但光标根本没变
+
+用 `SendInput`/`SetCursorPos` 打桩 + `GetWindowRect` 前后对比，实测（1012×641 CSS 视口，
+显示器 2560×1440 @125%，页面 `devicePixelRatio` = 1.375）：
+
+| 边缘内缩 | 拖动结果 |
+|---|---|
+| 3px（物理） | ✅ 窗口宽 +120 |
+| **8px（物理，≈5.8 CSS）** | ✅（6px 热区时） |
+| 12px（物理，≈8.7 CSS） | ❌ 毫无反应 |
+
+⇒ 拖动逻辑本身是通的，**6px 热区在 125% 缩放下只有 ~8 物理像素，稍微靠里就完全没有
+反馈**，用户就得出「不能调大小」的结论。
+
+但「指针不变形」是另一回事。用 `GetCursorInfo` + `GetIconInfo` 读指针**热点**做客观判据
+（箭头 = (0,0)，双向箭头 = 位图中心），实测：指针句柄从头到尾都是 **65539、(0,0)（箭头）**，
+一次都没变过，而页面侧 `getComputedStyle(html).cursor` 已经是 `ew-resize`。
+
+命中元素链揭示了原因：
+
+```
+MAIN.main = default      ← 命中元素
+DIV.app   = default
+BODY      = default
+HTML      = ew-resize    ← 只有它被 JS 设置了
+```
+
+**`body` / `.main` 的 computed cursor 是显式值 `default`，而显式声明优先于继承** ——
+在 `html` 上设 `ew-resize` 会被整条链盖掉。对照实验坐实链路没问题：注入一个显式
+`cursor:ew-resize` 的 div，指针立刻从 65539 变成 65553（双向箭头）。
+
+### 实现
+
+- **前端改成「八向抓取层」**：`buildResizeGrips()` 在 `body` 下建 `#resize-grips`
+  （`position:fixed; inset:0; pointer-events:none`），内含 8 个**自带 `cursor`** 的
+  grip（四边 8px、四角 14px）。抓取层只在最外 8px，页面内容距窗口边缘 ≥14px，
+  不挡滚动条/标题栏按钮
+- 拖动过程中鼠标会滑出抓取层，用 `body.style.cursor`（inline 覆盖它自己的 `default`）
+  + `body.resizing * { cursor: inherit !important }` 兜住全窗口光标
+- 热区 6px → 8px；`_compute_resized_rect` 的 `min_size` 参数化，后端按
+  `GetDpiForWindow/96` 把 `WINDOW_MIN_SIZE`（逻辑像素）换算成物理像素再夹（原来两套
+  坐标系混用，125% 屏上能拖得比设计值更小）
+- **标题栏新增「最大化/还原」按钮 + 双击标题栏切换**。`toggle_maximize()` 不用 Win32
+  `SW_MAXIMIZE`：本窗口没有 `WS_CAPTION`，系统算 `ptMaxSize` 会按**整块屏幕**给尺寸、
+  盖住任务栏；这里自己取 `GetMonitorInfoW` 的 `rcWork` 再 `SetWindowPos`（实测最大化后
+  rect == `SPI_GETWORKAREA` == 2560×1380，正好占满工作区不盖任务栏）。最大化状态下拖
+  标题栏 = 先还原，拖边缘忽略（与系统窗口一致）
+- **记住窗口几何**：拖动/缩放停止 1.2s 后防抖落库（`settings.payload.window_geometry`，
+  物理像素 + 当时 DPI 缩放），`close()`/`quit()`/托盘退出/Alt+F4 隐藏前立即落库；
+  下次启动按 `保存时的缩放` 折回逻辑像素交给 `create_window(width/height/x/y)`。
+  恢复前用 `_clamp_window_geometry` 夹进当前显示器工作区，**保存的位置已不在任何显示器
+  上（拔外接屏、改分辨率）自动回退默认居中**，不会把窗口丢到屏幕外
+- **矮窗口首页不再滚动**：首页改纵向 flex，`今日趋势` 卡 `flex:1` 吃掉剩余高度，
+  `.chart-box` 去掉写死的 `height:250px`；图表尺寸由 `fitChartCanvas()` 显式
+  `chart.resize(w,h)`（全站 `responsive:false`，canvas 不会自己跟随容器）。
+  再加 `@media (max-height: 820px)` 收紧卡片内边距/字号
+
+### 实测验收
+
+- 光标：左右边缘 → 65553(11,4)、上下 → 65555(4,11)、四角 → 65549(8,8)、
+  出热区/页面中心 → 65539(0,0) ✅
+- 拖动：右边缘 +136（期望 137）、底边缘 +110、右下角 +124/+96 ✅
+- 布局：1012×641 CSS 视口下首页 `scrollHeight - clientHeight = 0`（原来 196px）✅
+- 回归：`pytest` 27 passed、`smoke_multiuser.py` 43 passed / 0 failed ✅
+
+### 踩坑备忘
+
+- **`SendInput`/`SetCursorPos` 打桩必须在目标窗口处于前台时做**：窗口被遮挡时鼠标事件
+  进不了 WebView2，表现为「热区全部无反应」，会误判成前端 bug（第一次验证就这么栽了）
+- 探测一个已运行的 CmdGauge 时注意 `EnumWindows` 会先命中叫
+  `GDI+ Window (CmdGauge.exe)` 与隐藏的登录窗；主窗口用标题含 `Usage Panel` 认
+- 本机 `GetDpiForSystem()` 与 `GetDpiForWindow(hwnd)` 会不同（96 vs 120），
+  用系统 DPI 换算窗口尺寸会错；`MonitorFromWindow/GetMonitorInfoW` 与
+  `SetWindowPos/GetWindowRect` 在**同一 DPI 感知级别**下才自洽（脚本里非 pywebview 进程
+  早期取到的值是虚拟化坐标，正好差 1.25 倍）
