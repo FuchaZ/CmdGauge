@@ -898,6 +898,12 @@ async function loadDays() {
       body.innerHTML = html;
     }
     const totalPages = Math.max(1, Math.ceil(data.total / PAGE));
+    if (state.days.page > totalPages) {
+      // 同步/裁剪后总页数变少: 当前页越界时回退到末页并重载一次, 避免停在空页
+      state.days.page = totalPages;
+      loadDays();
+      return;
+    }
     $("day-pager").textContent = `${t("pageOf")} ${state.days.page} / ${totalPages} ${t("pages")}`;
     $("day-prev").disabled = state.days.page <= 1;
     $("day-next").disabled = state.days.page >= totalPages;
@@ -951,6 +957,12 @@ async function loadRecords() {
       body.innerHTML = html;
     }
     const totalPages = Math.max(1, Math.ceil(data.total / PAGE));
+    if (state.records.page > totalPages) {
+      // 同步/裁剪后总页数变少: 当前页越界时回退到末页并重载一次, 避免停在空页
+      state.records.page = totalPages;
+      loadRecords();
+      return;
+    }
     $("rec-pager").textContent = `${t("pageOf")} ${state.records.page} / ${totalPages} ${t("pages")}`;
     $("pg-prev").disabled = state.records.page <= 1;
     $("pg-next").disabled = state.records.page >= totalPages;
@@ -1512,6 +1524,7 @@ function promptApiKey(mode = "relogin") {
         if (state.page === "overview") loadOverview(true).catch(() => {});
       } catch (e) {
         toast(e.message || t("apikeyInvalid"), "err");
+        return false;  // 校验失败: 留在弹窗, 不丢已输入的 Key
       }
     },
   });

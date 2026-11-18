@@ -663,9 +663,10 @@ def _handle_api(handler: BaseHTTPRequestHandler, path: str, query: dict[str, lis
         _ensure_quota_async(active_id)
         slot = _quota_cache.get(active_id) or {}
         quota = slot.get("data") if token else None
-        # 模型排行合并缓存命中率 (来自 5 分钟聚合桶, 与明细表口径不同源)
-        models = db.model_stats(period)
-        cache_by_model = {m["model"]: m for m in db.model_cache_stats(period)}
+        # 活跃账号解析一次, 全部聚合显式传 id: 各 db.* 内部各自解析活跃账号会
+        # 重复跑 2-3 条查询, 一次 dashboard 请求要重复解析 ~8 次
+        models = db.model_stats(period, active_id)
+        cache_by_model = {m["model"]: m for m in db.model_cache_stats(period, active_id)}
         for m in models:
             c = cache_by_model.get(m["model"])
             m["hit_rate"] = c["hit_rate"] if c else None
@@ -674,7 +675,7 @@ def _handle_api(handler: BaseHTTPRequestHandler, path: str, query: dict[str, lis
             m["cache_savings"] = c["cache_savings"] if c else 0.0
         # API Key 模式没有请求明细, 用账单周期汇总兜底, 并明确标注口径来源
         _, _, _, auth_type = db.get_account_credentials(active_id)
-        totals = db.totals(period)
+        totals = db.totals(period, active_id)
         totals_source = "records"
         if auth_type == AUTH_APIKEY:
             fb = db.summary_as_totals(db.get_account_summary(active_id))
@@ -692,15 +693,17 @@ def _handle_api(handler: BaseHTTPRequestHandler, path: str, query: dict[str, lis
                 "quota": quota,
                 "totals": totals,
                 "totals_source": totals_source,
-                "today": totals if totals_source == "billing-period" else db.totals("today"),
-                "cache": db.cache_stats(period),
-                "daily": db.daily_stats(7) if totals_source == "records" else [],
-                "trend": db.daily_stats(30) if totals_source == "records" else [],
-                "today_trend": db.today_trend() if totals_source == "records" else [],
+                "totals": totals,
+                "totals_source": totals_source,
+                "today": totals if totals_source == "billing-period" else db.totals("today", active_id),
+                "cache": db.cache_stats(period, active_id),
+                "daily": db.daily_stats(7, active_id) if totals_source == "records" else [],
+                "trend": db.daily_stats(30, active_id) if totals_source == "records" else [],
+                "today_trend": db.today_trend(active_id) if totals_source == "records" else [],
                 "models": models if totals_source == "records" else [],
                 "sync": db.get_sync_state(),
                 "progress": _sync_progress_snapshot(),
-                "range": range_param,
+                "range": period,   # 回显**实际生效**的范围 (非法参数回落 30d)
                 "auth_type": auth_type,
                 "usage_page_url": usage_page_url(account.get("login", "")),
                 "exchange_rate": {"usd_cny": _fetch_usd_cny(), "currency": "CNY"},

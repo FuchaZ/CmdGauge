@@ -1135,8 +1135,13 @@ def usage_records_page(
         where.append("datetime(created_at) >= datetime('now', ?)")
         params.append(f"-{days} days")
     if status:
-        where.append("status = ?")
-        params.append(status)
+        if status.strip().lower() == "failed":
+            # 与统计口径一致: 非 completed (且非空) 一律算失败 —— 上游失败状态
+            # 可能不止 "failed" 一种字面量, 只按精确匹配会漏掉 (统计口径见 _SUM_SQL)
+            where.append("(status IS NOT NULL AND status != '' AND status != 'completed')")
+        else:
+            where.append("status = ?")
+            params.append(status)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     where_sql, params = _account_filter(where_sql, params, _resolve_account_id(account_id))
     conn = get_db()

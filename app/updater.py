@@ -54,7 +54,15 @@ def _fetch_text(url: str) -> str:
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
                 return resp.read().decode("utf-8", "replace")
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        except urllib.error.HTTPError as exc:
+            # 4xx (除 429 限流) 是确定性失败: 重试也不会成功, 立即抛出交给降级路径
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise
+            last = exc
+            if attempt < _MAX_ATTEMPTS:
+                time.sleep(_RETRY_SLEEP)
+                continue
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last = exc
             if attempt < _MAX_ATTEMPTS:
                 time.sleep(_RETRY_SLEEP)

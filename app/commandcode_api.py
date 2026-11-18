@@ -900,8 +900,13 @@ def fetch_session_info(cred: str, auth_type: str = AUTH_COOKIE) -> SessionInfo:
     if not payload:
         # 未登录时端点返回 200 + 字面量 null
         return SessionInfo(status="expired", error="会话为空, 需要重新登录")
-    session = payload.get("session") or {}
-    user = payload.get("user") or {}
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else None
+    if session is None or not str(session.get("expiresAt") or "").strip():
+        # 响应是对象但 session 缺失/为 null (cookie 失效的变体形态): 与字面量 null
+        # 同样按过期处理 —— 原实现一律 status="ok" 且 expires_at="", 保活会把
+        # 已失效会话当作仍然存活记录下去
+        return SessionInfo(status="expired", error="会话为空, 需要重新登录")
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
     return SessionInfo(
         status="ok",
         expires_at=str(session.get("expiresAt") or ""),

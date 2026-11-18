@@ -111,6 +111,13 @@ def test_usage_buckets_cache_stats(tmp_db):
     """5 分钟聚合桶: 覆盖式 upsert / 缓存口径 / 账号隔离."""
     a1 = db.add_account("ck1", login="alice")
     a2 = db.add_account("ck2", login="bob")
+    # 桶时间戳相对「现在」生成: 原实现硬编码 2026-09-17, 超过 30 天后
+    # prune_old_records 会把它们清掉, 测试随日期推移失效 (时间炸弹)
+    from datetime import datetime, timedelta, timezone
+
+    def recent(minutes_ago: int) -> str:
+        ts = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
 
     def bucket(model, ts, tin=100, cr=80, req=1, savings=0.5):
         return {
@@ -123,10 +130,10 @@ def test_usage_buckets_cache_stats(tmp_db):
             "consumed_total": 0.01, "cache_read_tokens": cr, "cache_creation_tokens": 0,
         }
 
-    assert db.insert_usage_buckets([bucket("m/a", "2026-09-17 16:50:00")], a1) == 1
-    assert db.insert_usage_buckets([bucket("m/a", "2026-09-17 16:50:00")], a1) == 0  # 同桶不新增
+    assert db.insert_usage_buckets([bucket("m/a", recent(10))], a1) == 1
+    assert db.insert_usage_buckets([bucket("m/a", recent(10))], a1) == 0  # 同桶不新增
     # 同桶累计值应被覆盖而非累加
-    db.insert_usage_buckets([bucket("m/a", "2026-09-17 16:50:00", req=5, tin=999, cr=900)], a1)
+    db.insert_usage_buckets([bucket("m/a", recent(10), req=5, tin=999, cr=900)], a1)
     st = db.cache_stats("all", a1)
     assert (st["requests"], st["tokens_in"], st["cache_read_tokens"]) == (5, 999, 900), st
     assert st["hit_rate"] == round(900 / 999 * 100, 2)
@@ -134,7 +141,7 @@ def test_usage_buckets_cache_stats(tmp_db):
     assert st["bucket_count"] == 1
 
     # 账号隔离 (主键含 account_id, 同 model+桶不互相覆盖)
-    db.insert_usage_buckets([bucket("m/a", "2026-09-17 16:50:00", tin=7, cr=7)], a2)
+    db.insert_usage_buckets([bucket("m/a", recent(10), tin=7, cr=7)], a2)
     assert db.cache_stats("all", a1)["tokens_in"] == 999
     assert db.cache_stats("all", a2)["tokens_in"] == 7
 
@@ -143,12 +150,11 @@ def test_usage_buckets_cache_stats(tmp_db):
     assert db.cache_stats("all", a3)["hit_rate"] == 0.0
     assert db.cache_stats("all", a3)["bucket_count"] == 0
 
-    # 按模型 + prune 同步清理
-    db.insert_usage_buckets([bucket("m/b", "2026-09-17 16:55:00", tin=50, cr=25)], a1)
+    # 按模型 + prune 同理
+    db.insert_usage_buckets([bucket("m/b", recent(5), tin=50, cr=25)], a1)
     mc = {m["model"]: m for m in db.model_cache_stats("all", a1)}
     assert mc["m/a"]["hit_rate"] == round(900 / 999 * 100, 2)
     assert mc["m/b"]["hit_rate"] == 50.0
-    from datetime import datetime, timedelta, timezone
 
     old = (datetime.now(timezone.utc) - timedelta(days=100)).strftime("%Y-%m-%d %H:%M:%S")
     db.insert_usage_buckets([bucket("m/old", old, tin=1, cr=1)], a1)
@@ -305,3 +311,73 @@ def test_records_page_filters(tmp_db):
     recs, total = db.usage_records_page(1, 10, status="failed", account_id=a)
     assert total == 1 and recs[0]["usg_id"] == "u3"
     assert sorted(db.list_models(a)) == ["alpha", "beta"]
+
+
+# ---------------------------------------------------------------------------
+# 窗口几何 / 账号汇总快照 / 活跃账号边界 (v1.0.6 补充)
+# ---------------------------------------------------------------------------
+
+
+def test_window_geometry_roundtrip(tmp_db):
+    """几何读写往返; None 清除记录."""
+    assert db.get_window_geometry() is None
+    geo = {"left": 100, "top": 50, "width": 1600, "height": 1000, "scale": 1.25}
+    db.save_window_geometry(geo)
+    assert db.get_window_geometry() == geo
+    # 与 settings 写入互不覆盖
+    db.save_settings({"sync_interval_sec": 900})
+    assert db.get_window_geometry() == geo
+    assert db.get_settings()["sync_interval_sec"] == 900
+    db.save_window_geometry(None)
+    assert db.get_window_geometry() is None
+
+
+def test_account_summary_roundtrip(tmp_db):
+    """API Key 模式的账单周期汇总: 保存/覆盖/读取."""
+    aid = db.add_account("sk-key", login="alice", auth_type="apikey")
+    assert db.get_account_summary(aid) == {}
+    summary = {"totalCount": 42, "failedCount": 2, "totalTokensIn": 1000,
+               "totalTokensOut": 200, "totalCost": 1.5, "periodBasis": "billing"}
+    db.save_account_summary(summary, aid)
+    got = db.get_account_summary(aid)
+    assert got["totalCount"] == 42
+    assert got["_period_basis"] == "billing"
+    assert got["_updated_at"]
+    # 覆盖式更新
+    db.save_account_summary({"totalCount": 50}, aid)
+    assert db.get_account_summary(aid)["totalCount"] == 50
+
+
+def test_summary_as_totals_mapping(tmp_db):
+    summary = {"totalCount": 10, "failedCount": 1, "totalTokensIn": 700,
+               "totalTokensOut": 300, "totalCost": 0.5, "averageCost": 0.05,
+               "successRate": 90.0, "periodBasis": "billing"}
+    out = db.summary_as_totals(summary)
+    assert out["request_count"] == 10
+    assert out["failed_count"] == 1
+    assert out["success_count"] == 9
+    assert out["success_rate"] == 90.0
+    assert out["total_tokens"] == 1000
+    assert out["total_cost_usd"] == 0.5
+    assert out["avg_cost_usd"] == 0.05
+    assert out["period_basis"] == "billing"
+
+
+def test_active_account_id_zero_when_no_accounts(tmp_db):
+    """删光账号后活跃 id 为 0, 各查询返回空而非崩溃."""
+    for acc in db.list_accounts():
+        db.delete_account(acc["id"])
+    assert db.get_active_account_id() == 0
+    assert db.totals("all")["request_count"] == 0
+    assert db.model_stats("all") == []
+    assert db.cache_stats("all")["bucket_count"] == 0
+    assert db.usage_records_page()[1] == 0
+    assert db.day_stats_page()[1] == 0
+    assert db.list_models() == []
+
+
+def test_prune_window_days_string(tmp_db):
+    """window_days 边界: 字符串数字可入库, 非法串保留原值."""
+    assert db.save_settings({"window_days": "90"})["window_days"] == 90
+    assert db.save_settings({"window_days": "abc"})["window_days"] == 90
+    assert db.save_settings({"window_days": 0})["window_days"] == 1   # 夹到下界
